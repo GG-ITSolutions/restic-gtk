@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Restic GTK
+Comment=Browse snapshots of multiple restic repositories
+Exec=restic-gtk
+Icon=drive-harddisk
+Terminal=false
+Categories=GTK;GNOME;Utility;Archiving;
+StartupNotify=true

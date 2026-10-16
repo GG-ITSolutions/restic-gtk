@@ -1,0 +1,12 @@
+[package]
+name = "restic-gtk"
+version = "0.1.0"
+edition = "2024"
+description = "GTK4/libadwaita browser for multiple restic repositories"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.11", features = ["gnome_50"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_9"] }
+
+[build-dependencies]
+glib-build-tools = "0.22"

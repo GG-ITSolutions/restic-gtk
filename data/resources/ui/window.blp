@@ -1,0 +1,26 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $ResticGtkWindow: Adw.ApplicationWindow {
+  title: _("Restic GTK");
+  default-width: 900;
+  default-height: 640;
+
+  content: Adw.ToolbarView {
+    [top]
+    Adw.HeaderBar {
+      [start]
+      Gtk.Button add_repo_button {
+        icon-name: "list-add-symbolic";
+        tooltip-text: _("Add Repository");
+        sensitive: false;
+      }
+    }
+
+    content: Adw.StatusPage {
+      icon-name: "drive-harddisk-symbolic";
+      title: _("No Repositories");
+      description: _("Add a restic repository to browse its snapshots.");
+    };
+  };
+}
