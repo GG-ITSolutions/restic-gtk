@@ -1,0 +1,129 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $ResticGtkRestoreDialog: Adw.Dialog {
+  title: _("Restore");
+  content-width: 440;
+
+  child: Adw.ToolbarView {
+    [top]
+    Adw.HeaderBar {
+      show-title: false;
+    }
+
+    content: Gtk.Stack stack {
+      transition-type: crossfade;
+      vhomogeneous: false;
+
+      Gtk.StackPage {
+        name: "checking";
+
+        child: Adw.StatusPage checking_status {
+          title: _("Checking Target Folder");
+          paintable: Adw.SpinnerPaintable {
+            widget: checking_status;
+          };
+
+          styles [
+            "compact",
+          ]
+        };
+      }
+
+      Gtk.StackPage {
+        name: "confirm";
+
+        child: Adw.StatusPage confirm_status {
+          icon-name: "dialog-warning-symbolic";
+          title: _("Replace Existing Files?");
+
+          child: Gtk.Box {
+            spacing: 12;
+            halign: center;
+            homogeneous: true;
+
+            Gtk.Button {
+              label: _("_Cancel");
+              use-underline: true;
+              clicked => $on_cancel() swapped;
+
+              styles [
+                "pill",
+              ]
+            }
+
+            Gtk.Button {
+              label: _("_Replace");
+              use-underline: true;
+              clicked => $on_replace() swapped;
+
+              styles [
+                "pill",
+                "destructive-action",
+              ]
+            }
+          };
+
+          styles [
+            "compact",
+          ]
+        };
+      }
+
+      Gtk.StackPage {
+        name: "progress";
+
+        child: Gtk.Box {
+          orientation: vertical;
+          spacing: 12;
+          margin-top: 12;
+          margin-bottom: 36;
+          margin-start: 24;
+          margin-end: 24;
+
+          Gtk.Label progress_title {
+            wrap: true;
+            justify: center;
+
+            styles [
+              "title-3",
+            ]
+          }
+
+          Gtk.ProgressBar progress_bar {}
+
+          Gtk.Label progress_label {
+            styles [
+              "dimmed",
+              "numeric",
+            ]
+          }
+        };
+      }
+
+      Gtk.StackPage {
+        name: "error";
+
+        child: Adw.StatusPage error_status {
+          icon-name: "dialog-error-symbolic";
+          title: _("Restore Failed");
+
+          child: Gtk.Button {
+            label: _("_Close");
+            use-underline: true;
+            halign: center;
+            clicked => $on_cancel() swapped;
+
+            styles [
+              "pill",
+            ]
+          };
+
+          styles [
+            "compact",
+          ]
+        };
+      }
+    };
+  };
+}

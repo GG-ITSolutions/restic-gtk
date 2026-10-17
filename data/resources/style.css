@@ -1,0 +1,7 @@
+pathbar {
+  padding: 0 6px 6px 6px;
+}
+
+pathbar button.current {
+  font-weight: bold;
+}

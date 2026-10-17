@@ -1,0 +1,197 @@
+using Gtk 4.0;
+using Adw 1;
+using Gio 2.0;
+
+template $ResticGtkBrowserPage: Adw.NavigationPage {
+  tag: "browser";
+
+  child: Adw.ToolbarView {
+    [top]
+    Adw.HeaderBar {
+      title-widget: Adw.WindowTitle window_title {};
+    }
+
+    [top]
+    $ResticGtkPathBar path_bar {}
+
+    content: Gtk.Stack stack {
+      transition-type: crossfade;
+
+      Gtk.StackPage {
+        name: "index";
+
+        child: Adw.StatusPage index_status {
+          title: _("Loading Index");
+          description: _("The repository index is loaded once per session, which can take a while for large repositories");
+          paintable: Adw.SpinnerPaintable {
+            widget: index_status;
+          };
+
+          child: Gtk.ProgressBar index_progress {
+            halign: center;
+            width-request: 240;
+          };
+        };
+      }
+
+      Gtk.StackPage {
+        name: "index-error";
+
+        child: Adw.StatusPage index_error_status {
+          icon-name: "dialog-error-symbolic";
+          title: _("Could Not Load Index");
+
+          child: Gtk.Button {
+            label: _("_Try Again");
+            use-underline: true;
+            halign: center;
+            clicked => $on_retry_index() swapped;
+
+            styles [
+              "pill",
+            ]
+          };
+        };
+      }
+
+      Gtk.StackPage {
+        name: "loading";
+
+        child: Adw.Spinner {
+          halign: center;
+          valign: center;
+          width-request: 32;
+          height-request: 32;
+        };
+      }
+
+      Gtk.StackPage {
+        name: "error";
+
+        child: Adw.StatusPage error_status {
+          icon-name: "dialog-error-symbolic";
+          title: _("Could Not Open Folder");
+        };
+      }
+
+      Gtk.StackPage {
+        name: "empty";
+
+        child: Adw.StatusPage {
+          icon-name: "folder-symbolic";
+          title: _("Folder Is Empty");
+        };
+      }
+
+      Gtk.StackPage {
+        name: "list";
+
+        child: Gtk.ScrolledWindow scrolled_window {
+          child: Gtk.ColumnView column_view {
+            tab-behavior: item;
+            activate => $on_activate() swapped;
+
+            model: Gtk.MultiSelection selection {
+              model: Gio.ListStore entries {
+                item-type: typeof<$ResticGtkEntryObject>;
+              };
+            };
+
+            Gtk.ColumnViewColumn {
+              title: _("Name");
+              expand: true;
+
+              factory: Gtk.BuilderListItemFactory {
+                template Gtk.ColumnViewCell {
+                  child: Gtk.Box {
+                    spacing: 12;
+
+                    Gtk.Image {
+                      icon-name: bind template.item as <$ResticGtkEntryObject>.icon-name;
+                    }
+
+                    Gtk.Label {
+                      xalign: 0;
+                      ellipsize: middle;
+                      label: bind template.item as <$ResticGtkEntryObject>.name;
+                    }
+                  };
+                }
+              };
+            }
+
+            Gtk.ColumnViewColumn {
+              title: _("Size");
+              fixed-width: 110;
+
+              factory: Gtk.BuilderListItemFactory {
+                template Gtk.ColumnViewCell {
+                  child: Gtk.Label {
+                    xalign: 1;
+                    label: bind template.item as <$ResticGtkEntryObject>.size-label;
+
+                    styles [
+                      "dimmed",
+                      "numeric",
+                    ]
+                  };
+                }
+              };
+            }
+
+            Gtk.ColumnViewColumn {
+              title: _("Modified");
+              fixed-width: 170;
+
+              factory: Gtk.BuilderListItemFactory {
+                template Gtk.ColumnViewCell {
+                  child: Gtk.Label {
+                    xalign: 0;
+                    label: bind template.item as <$ResticGtkEntryObject>.modified-label;
+
+                    styles [
+                      "dimmed",
+                      "numeric",
+                    ]
+                  };
+                }
+              };
+            }
+
+            styles [
+              "data-table",
+            ]
+          };
+        };
+      }
+    };
+
+    [bottom]
+    Gtk.ActionBar {
+      [start]
+      Gtk.Label selection_label {
+        styles [
+          "dimmed",
+        ]
+      }
+
+      [end]
+      Gtk.Button {
+        label: _("_Restore…");
+        use-underline: true;
+        action-name: "browser.restore";
+
+        styles [
+          "suggested-action",
+        ]
+      }
+
+      [end]
+      Gtk.Button {
+        label: _("_Open");
+        use-underline: true;
+        action-name: "browser.open";
+      }
+    }
+  };
+}

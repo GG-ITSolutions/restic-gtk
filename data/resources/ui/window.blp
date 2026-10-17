@@ -2,25 +2,125 @@ using Gtk 4.0;
 using Adw 1;
 
 template $ResticGtkWindow: Adw.ApplicationWindow {
-  title: _("Restic GTK");
-  default-width: 900;
-  default-height: 640;
+  title: _("Restic");
+  default-width: 1000;
+  default-height: 680;
+  width-request: 360;
+  height-request: 294;
 
-  content: Adw.ToolbarView {
-    [top]
-    Adw.HeaderBar {
-      [start]
-      Gtk.Button add_repo_button {
-        icon-name: "list-add-symbolic";
-        tooltip-text: _("Add Repository");
-        sensitive: false;
-      }
+  Adw.Breakpoint {
+    condition ("max-width: 640sp")
+
+    setters {
+      split_view.collapsed: true;
     }
+  }
 
-    content: Adw.StatusPage {
-      icon-name: "drive-harddisk-symbolic";
-      title: _("No Repositories");
-      description: _("Add a restic repository to browse its snapshots.");
+  content: Adw.ToastOverlay toast_overlay {
+    child: Adw.NavigationSplitView split_view {
+      min-sidebar-width: 240;
+
+      sidebar: Adw.NavigationPage {
+        title: _("Repositories");
+
+        child: Adw.ToolbarView {
+          [top]
+          Adw.HeaderBar {
+            [start]
+            Gtk.Button {
+              icon-name: "list-add-symbolic";
+              tooltip-text: _("Add Repository");
+              action-name: "win.add-repository";
+            }
+          }
+
+          content: Adw.Sidebar sidebar {
+            menu-model: repo_menu;
+
+            placeholder: Adw.StatusPage {
+              icon-name: "drive-harddisk-symbolic";
+              title: _("No Repositories");
+
+              styles [
+                "compact",
+              ]
+            };
+          };
+        };
+      };
+
+      content: Adw.NavigationPage {
+        title: _("Restic");
+
+        child: Adw.NavigationView content_view {
+          Adw.NavigationPage welcome_page {
+            title: _("Restic");
+            tag: "welcome";
+
+            child: Adw.ToolbarView {
+              [top]
+              Adw.HeaderBar {
+                show-title: false;
+              }
+
+              content: Gtk.Stack welcome_stack {
+                Gtk.StackPage {
+                  name: "empty";
+
+                  child: Adw.StatusPage {
+                    icon-name: "drive-harddisk-symbolic";
+                    title: _("No Repositories");
+                    description: _("Add a restic repository to browse and restore its snapshots");
+
+                    child: Gtk.Button {
+                      label: _("_Add Repository…");
+                      use-underline: true;
+                      halign: center;
+                      action-name: "win.add-repository";
+
+                      styles [
+                        "pill",
+                        "suggested-action",
+                      ]
+                    };
+                  };
+                }
+
+                Gtk.StackPage {
+                  name: "select";
+
+                  child: Adw.StatusPage {
+                    icon-name: "drive-harddisk-symbolic";
+                    title: _("No Repository Selected");
+                    description: _("Select a repository to browse its snapshots");
+                  };
+                }
+              };
+            };
+          }
+        };
+      };
     };
   };
+}
+
+menu repo_menu {
+  section {
+    item {
+      label: _("_Edit…");
+      action: "win.edit-repository";
+    }
+
+    item {
+      label: _("_Lock");
+      action: "win.lock-repository";
+    }
+  }
+
+  section {
+    item {
+      label: _("_Remove…");
+      action: "win.remove-repository";
+    }
+  }
 }

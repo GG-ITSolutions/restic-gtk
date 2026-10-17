@@ -1,0 +1,71 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $ResticGtkRepoDialog: Adw.Dialog {
+  content-width: 460;
+  default-widget: save_button;
+  focus-widget: name_row;
+
+  child: Adw.ToolbarView {
+    [top]
+    Adw.HeaderBar {
+      show-start-title-buttons: false;
+      show-end-title-buttons: false;
+
+      [start]
+      Gtk.Button {
+        label: _("_Cancel");
+        use-underline: true;
+        clicked => $on_cancel() swapped;
+      }
+
+      [end]
+      Gtk.Button save_button {
+        use-underline: true;
+        sensitive: false;
+        clicked => $on_save() swapped;
+
+        styles [
+          "suggested-action",
+        ]
+      }
+    }
+
+    content: Gtk.Box {
+      orientation: vertical;
+      spacing: 12;
+      margin-top: 12;
+      margin-bottom: 24;
+      margin-start: 12;
+      margin-end: 12;
+
+      Adw.PreferencesGroup {
+        description: _("A rest-server URL such as rest:https://user:password@host/repository/ or the path of a local repository. The repository password is asked for when unlocking and never stored.");
+
+        Adw.EntryRow name_row {
+          title: _("Name");
+          activates-default: true;
+          changed => $on_changed() swapped;
+        }
+
+        Adw.EntryRow location_row {
+          title: _("Location");
+          activates-default: true;
+          input-purpose: url;
+          changed => $on_changed() swapped;
+        }
+      }
+
+      Gtk.Label error_label {
+        visible: false;
+        xalign: 0;
+        wrap: true;
+
+        styles [
+          "error",
+          "caption",
+        ]
+      }
+    };
+  };
+}

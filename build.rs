@@ -1,6 +1,13 @@
 use std::{env, path::PathBuf, process::Command};
 
-const BLUEPRINTS: &[&str] = &["window.blp"];
+const BLUEPRINTS: &[&str] = &[
+    "browser-page.blp",
+    "repo-dialog.blp",
+    "restore-dialog.blp",
+    "snapshots-page.blp",
+    "unlock-dialog.blp",
+    "window.blp",
+];
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());

@@ -23,6 +23,7 @@ rustPlatform.buildRustPackage {
       ../Cargo.lock
       ../build.rs
       ../src
+      ../tests
       ../data
     ];
   };
