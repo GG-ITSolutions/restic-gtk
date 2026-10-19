@@ -32,7 +32,7 @@ fn recorder() -> (
 #[test]
 fn store_round_trips_and_is_private() {
     let dir = tempfile::tempdir().unwrap();
-    let store = RepoStore::new(&dir.path().join("config"));
+    let mut store = RepoStore::new(&dir.path().join("config"));
     assert!(store.load().unwrap().is_empty());
 
     let repos = vec![
@@ -44,6 +44,37 @@ fn store_round_trips_and_is_private() {
     assert_eq!(store.load().unwrap(), repos);
     assert_eq!(mode(store.path()), 0o600);
     assert_eq!(mode(store.path().parent().unwrap()), 0o700);
+}
+
+#[test]
+fn invalid_store_is_moved_aside() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = RepoStore::new(dir.path());
+    fs::write(store.path(), "not json").unwrap();
+
+    assert!(matches!(store.load(), Err(Error::Store(_))));
+    assert!(!store.path().exists());
+    assert_eq!(fs::read_to_string(store.broken_path()).unwrap(), "not json");
+
+    let repos = vec![RepoConfig::new("Local", "/srv/restic")];
+    store.save(&repos).unwrap();
+    assert_eq!(store.load().unwrap(), repos);
+}
+
+#[test]
+fn unreadable_store_is_kept_and_not_overwritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = RepoStore::new(dir.path());
+    // A folder fails to read even as root, unlike missing permissions.
+    fs::create_dir(store.path()).unwrap();
+
+    assert!(matches!(store.load(), Err(Error::Io(_))));
+    assert!(store.path().is_dir());
+    assert!(!store.broken_path().exists());
+
+    let repos = vec![RepoConfig::new("Local", "/srv/restic")];
+    assert!(matches!(store.save(&repos), Err(Error::StoreReadOnly)));
+    assert!(store.path().is_dir());
 }
 
 #[test]

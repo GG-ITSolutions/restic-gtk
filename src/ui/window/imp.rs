@@ -2,7 +2,10 @@ use std::cell::{Cell, OnceCell, RefCell};
 
 use adw::{prelude::*, subclass::prelude::*};
 use gtk::{CompositeTemplate, glib, glib::clone};
-use restic_gtk::{backend::RepoStore, config};
+use restic_gtk::{
+    backend::{Error, RepoStore},
+    config,
+};
 
 use crate::ui::{
     details,
@@ -20,6 +23,8 @@ pub struct ResticGtkWindow {
     pub toast_overlay: TemplateChild<adw::ToastOverlay>,
     #[template_child]
     split_view: TemplateChild<adw::NavigationSplitView>,
+    #[template_child]
+    repo_banner: TemplateChild<adw::Banner>,
     #[template_child]
     sidebar: TemplateChild<adw::Sidebar>,
     #[template_child]
@@ -78,12 +83,22 @@ impl ObjectImpl for ResticGtkWindow {
         self.parent_constructed();
         let obj = self.obj();
 
-        let (repos, error) = RepoList::load(RepoStore::new(&config::config_dir()));
-        if let Some(error) = error {
-            show_toast(
+        let store = RepoStore::new(&config::config_dir());
+        let broken = store.broken_path();
+        let (repos, error) = RepoList::load(store);
+        match error {
+            None => {}
+            Some(err @ Error::Store(_)) => show_toast(
                 &*obj,
-                &format!("The repository list could not be read and was moved aside: {error}"),
-            );
+                &format!("{err}. It was moved to “{}”.", broken.display()),
+            ),
+            Some(err) => {
+                show_toast(
+                    &*obj,
+                    &format!("The repository list could not be read: {err}"),
+                );
+                self.repo_banner.set_revealed(true);
+            }
         }
 
         let section = adw::SidebarSection::new();

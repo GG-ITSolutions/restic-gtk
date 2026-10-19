@@ -34,6 +34,11 @@ template $ResticGtkWindow: Adw.ApplicationWindow {
             }
           }
 
+          [top]
+          Adw.Banner repo_banner {
+            title: _("Changes to this list are not saved");
+          }
+
           content: Adw.Sidebar sidebar {
             menu-model: repo_menu;
 

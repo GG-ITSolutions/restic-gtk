@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 
-use super::Result;
+use super::{Error, Result};
 
 /// Stable identity of a repository entry, independent of name and location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -103,12 +103,15 @@ const STORE_VERSION: u32 = 1;
 #[derive(Debug, Clone)]
 pub struct RepoStore {
     path: PathBuf,
+    /// Set when the file exists but couldn't be read: saving would replace it with a partial list.
+    read_only: bool,
 }
 
 impl RepoStore {
     pub fn new(dir: &Path) -> Self {
         Self {
             path: dir.join("repos.json"),
+            read_only: false,
         }
     }
 
@@ -116,16 +119,46 @@ impl RepoStore {
         &self.path
     }
 
-    pub fn load(&self) -> Result<Vec<RepoConfig>> {
-        match fs::read(&self.path) {
-            Ok(data) => Ok(serde_json::from_slice::<StoreFile>(&data)?.repositories),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(err) => Err(err.into()),
+    /// The moved aside file of an invalid list, see [`load`](Self::load).
+    pub fn broken_path(&self) -> PathBuf {
+        self.path.with_extension("json.broken")
+    }
+
+    /// Reads the list; a missing file is an empty list.
+    ///
+    /// Invalid JSON can't be fixed by the app, so the file is moved to
+    /// [`broken_path`](Self::broken_path) to start over and [`Error::Store`] is returned. On any
+    /// other error the file is kept and every later [`save`](Self::save) fails, so the list read
+    /// so far can't replace it.
+    pub fn load(&mut self) -> Result<Vec<RepoConfig>> {
+        let data = match fs::read(&self.path) {
+            Ok(data) => data,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => {
+                self.read_only = true;
+                return Err(err.into());
+            }
+        };
+        match serde_json::from_slice::<StoreFile>(&data) {
+            Ok(file) => Ok(file.repositories),
+            Err(err) => {
+                if let Err(rename) = fs::rename(&self.path, self.broken_path()) {
+                    self.read_only = true;
+                    return Err(Error::Io(io::Error::new(
+                        rename.kind(),
+                        format!("{err}, and moving it aside failed: {rename}"),
+                    )));
+                }
+                Err(err.into())
+            }
         }
     }
 
     /// Writes the list atomically (temp file + rename), readable only by the user.
     pub fn save(&self, repos: &[RepoConfig]) -> Result<()> {
+        if self.read_only {
+            return Err(Error::StoreReadOnly);
+        }
         let dir = self.path.parent().expect("store path has a parent");
         DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
 

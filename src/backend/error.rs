@@ -25,6 +25,10 @@ pub enum Error {
     #[error("Invalid repository list: {0}")]
     Store(#[from] serde_json::Error),
 
+    /// The repository list exists but couldn't be read, see `RepoStore::load`.
+    #[error("The repository list could not be read, so changes are not saved")]
+    StoreReadOnly,
+
     #[error(transparent)]
     Io(#[from] io::Error),
 

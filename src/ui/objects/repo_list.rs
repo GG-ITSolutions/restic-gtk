@@ -1,7 +1,5 @@
-use std::fs;
-
 use gtk::{gio, prelude::*};
-use restic_gtk::backend::{RepoConfig, RepoStore, Result};
+use restic_gtk::backend::{Error, RepoConfig, RepoStore, Result};
 
 use super::RepoObject;
 
@@ -13,9 +11,9 @@ pub struct RepoList {
 }
 
 impl RepoList {
-    /// Loads the list. An unreadable file is moved aside to `repos.json.broken`
-    /// instead of being overwritten later; the error is returned for display.
-    pub fn load(store: RepoStore) -> (Self, Option<String>) {
+    /// Loads the list, starting empty on errors; see [`RepoStore::load`] for what happens to the
+    /// file. The error is returned for display.
+    pub fn load(mut store: RepoStore) -> (Self, Option<Error>) {
         let model = gio::ListStore::new::<RepoObject>();
         let error = match store.load() {
             Ok(configs) => {
@@ -24,10 +22,7 @@ impl RepoList {
                 }
                 None
             }
-            Err(err) => {
-                let _ = fs::rename(store.path(), store.path().with_extension("json.broken"));
-                Some(err.to_string())
-            }
+            Err(err) => Some(err),
         };
         (Self { store, model }, error)
     }
