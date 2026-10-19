@@ -3,9 +3,7 @@ use std::{env, path::PathBuf, process::Command};
 const BLUEPRINTS: &[&str] = &[
     "browser-page.blp",
     "repo-dialog.blp",
-    "repo-info-dialog.blp",
     "restore-dialog.blp",
-    "snapshot-info-dialog.blp",
     "snapshots-page.blp",
     "unlock-dialog.blp",
     "window.blp",

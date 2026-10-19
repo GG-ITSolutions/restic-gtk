@@ -5,9 +5,9 @@ use gtk::{CompositeTemplate, glib, glib::clone};
 use restic_gtk::{backend::RepoStore, config};
 
 use crate::ui::{
+    details,
     objects::{RepoList, RepoObject},
     repo_dialog::RepoDialog,
-    repo_info_dialog::RepoInfoDialog,
     restore_dialog::RestoreDialog,
     show_toast,
     snapshots_page::SnapshotsPage,
@@ -55,7 +55,7 @@ impl ObjectSubclass for ResticGtkWindow {
         });
         klass.install_action("win.repository-details", None, |win, _, _| {
             if let Some(repo) = win.imp().action_target() {
-                RepoInfoDialog::show(win, &repo);
+                details::show_repo(win, &repo);
             }
         });
         klass.install_action("win.lock-repository", None, |win, _, _| {

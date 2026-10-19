@@ -120,15 +120,15 @@ fn snapshots_carry_backup_summary() {
     let first = snapshots[1].summary.as_ref().unwrap();
 
     // readme.txt, deep.txt, größe.txt and the symlink.
-    assert_eq!(first.total_files, 4);
+    assert_eq!(first.total_files_processed, 4);
     assert_eq!(first.files_new, 4);
     assert!(first.data_added > 0);
     assert!(first.data_added_packed > 0);
     assert!(first.backup_end >= first.backup_start);
     assert!(snapshots[0].program_version.starts_with("rustic"));
 
-    assert_eq!(newest.total_files, 4);
-    assert_eq!(newest.total_bytes, first.total_bytes);
+    assert_eq!(newest.total_files_processed, 4);
+    assert_eq!(newest.total_bytes_processed, first.total_bytes_processed);
 }
 
 #[test]
@@ -144,7 +144,6 @@ fn repo_stats_count_files_and_data() {
     assert!(stats.packed_size > 0);
     // Packs are only part of the repository files.
     assert!(stats.stored_size > stats.packed_size);
-    assert!(stats.compression_ratio().is_some());
 }
 
 // --- browsing ------------------------------------------------------------

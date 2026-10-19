@@ -6,9 +6,9 @@ use restic_gtk::backend::{Snapshot, jiff::Zoned};
 
 use crate::ui::{
     browser_page::BrowserPage,
+    details,
     format::{self, DateGroup},
     objects::RepoObject,
-    repo_info_dialog::RepoInfoDialog,
     run_blocking,
     unlock_dialog::UnlockDialog,
 };
@@ -55,7 +55,7 @@ impl ObjectSubclass for SnapshotsPage {
         });
         klass.install_action("snapshots.reload", None, |page, _, _| page.imp().reload());
         klass.install_action("snapshots.details", None, |page, _, _| {
-            RepoInfoDialog::show(page, page.imp().repo())
+            details::show_repo(page, page.imp().repo())
         });
     }
 

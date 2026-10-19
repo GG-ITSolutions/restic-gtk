@@ -13,13 +13,13 @@ mod stats;
 mod store;
 mod tree;
 
-pub use rustic_core::jiff;
+pub use rustic_core::{jiff, repofile::SnapshotSummary};
 
 pub use error::{Error, Result};
 pub use progress::{ProgressKind, ProgressUpdate};
 pub use restore::{RestorePreview, RestoreRequest};
 pub use session::Session;
-pub use snapshot::{BackupSummary, Snapshot};
+pub use snapshot::Snapshot;
 pub use stats::RepoStats;
 pub use store::{RepoConfig, RepoId, RepoStore, validate_location};
 pub use tree::{Entry, EntryKind};

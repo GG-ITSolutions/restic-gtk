@@ -1,13 +1,12 @@
 //! The GTK user interface. Talks to repositories only through [`restic_gtk::backend`].
 
 mod browser_page;
+mod details;
 mod format;
 mod objects;
 mod path_bar;
 mod repo_dialog;
-mod repo_info_dialog;
 mod restore_dialog;
-mod snapshot_info_dialog;
 mod snapshots_page;
 mod unlock_dialog;
 mod window;

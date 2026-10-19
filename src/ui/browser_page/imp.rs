@@ -12,12 +12,11 @@ use restic_gtk::{
 };
 
 use crate::ui::{
-    add_toast, format,
+    add_toast, details, format,
     objects::{EntryObject, RepoObject},
     path_bar::PathBar,
     restore_dialog::RestoreDialog,
     run_blocking, show_toast,
-    snapshot_info_dialog::SnapshotInfoDialog,
 };
 
 /// How long a folder may take to load before the spinner shows, to avoid flicker.
@@ -78,7 +77,7 @@ impl ObjectSubclass for BrowserPage {
             page.imp().restore_selected()
         });
         klass.install_action("browser.details", None, |page, _, _| {
-            SnapshotInfoDialog::show(page, page.imp().snapshot())
+            details::show_snapshot(page, page.imp().snapshot())
         });
         klass.add_binding_action(gdk::Key::Up, gdk::ModifierType::ALT_MASK, "browser.go-up");
         klass.add_binding_action(

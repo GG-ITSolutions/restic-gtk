@@ -18,13 +18,6 @@ pub struct RepoStats {
     pub packed_size: u64,
 }
 
-impl RepoStats {
-    /// Uncompressed bytes per stored byte, `None` while there is no data.
-    pub fn compression_ratio(&self) -> Option<f64> {
-        (self.packed_size > 0).then(|| self.raw_size as f64 / self.packed_size as f64)
-    }
-}
-
 impl Session {
     /// Lists all repository files and reads the whole index, so this takes a
     /// moment on large remote repositories.
