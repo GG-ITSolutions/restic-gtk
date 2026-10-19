@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
-use gtk::{glib, glib::clone, prelude::*, subclass::prelude::*};
+use gtk::{gio, glib, glib::clone, prelude::*, subclass::prelude::*};
 use restic_gtk::backend::{ProgressUpdate, RepoConfig, Session};
-
-use crate::ui::run_blocking;
 
 mod imp {
     use std::cell::{Cell, RefCell};
@@ -132,39 +130,54 @@ impl RepoObject {
         self.set_index_fraction(-1.0);
         self.set_index_error(String::new());
 
-        let (sender, receiver) = async_channel::unbounded::<ProgressUpdate>();
-        glib::spawn_future_local(clone!(
-            #[weak(rename_to = repo)]
-            self,
-            async move {
-                while let Ok(update) = receiver.recv().await {
-                    repo.set_index_fraction(update.fraction().unwrap_or(-1.0));
-                }
-            }
-        ));
+        let (sender, receiver) = async_channel::unbounded();
+        let loading = session.clone();
+        let load = gio::spawn_blocking(move || {
+            let progress = sender.clone();
+            let result = loading.load_index(move |update| {
+                let _ = progress.send_blocking(IndexEvent::Progress(update));
+            });
+            let _ = sender.send_blocking(IndexEvent::Done(result));
+        });
 
         glib::spawn_future_local(clone!(
             #[weak(rename_to = repo)]
             self,
             async move {
-                let loading = session.clone();
-                let result = run_blocking(move || {
-                    loading.load_index(move |update| {
-                        let _ = sender.send_blocking(update);
-                    })
-                })
-                .await;
-
-                // Locked or re-unlocked meanwhile: this result belongs to an old session.
-                if !repo.session().is_some_and(|s| Arc::ptr_eq(&s, &session)) {
-                    return;
+                while let Ok(event) = receiver.recv().await {
+                    // Locked or re-unlocked meanwhile: everything left belongs to an old session.
+                    if !repo.is_current(&session) {
+                        return;
+                    }
+                    match event {
+                        IndexEvent::Progress(update) => {
+                            repo.set_index_fraction(update.fraction().unwrap_or(-1.0));
+                        }
+                        IndexEvent::Done(result) => {
+                            repo.set_indexing(false);
+                            match result {
+                                Ok(()) => repo.set_indexed(true),
+                                Err(err) => repo.set_index_error(err.to_string()),
+                            }
+                            return;
+                        }
+                    }
                 }
-                repo.set_indexing(false);
-                match result {
-                    Ok(()) => repo.set_indexed(true),
-                    Err(err) => repo.set_index_error(err.to_string()),
+                // Closed without `Done`: the load panicked, re-raise it like `run_blocking`.
+                if let Err(panic) = load.await {
+                    std::panic::resume_unwind(panic);
                 }
             }
         ));
     }
+
+    fn is_current(&self, session: &Arc<Session>) -> bool {
+        self.session().is_some_and(|s| Arc::ptr_eq(&s, session))
+    }
+}
+
+/// Messages of a running index load, in order.
+enum IndexEvent {
+    Progress(ProgressUpdate),
+    Done(restic_gtk::backend::Result<()>),
 }
