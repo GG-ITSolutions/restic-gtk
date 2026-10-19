@@ -32,7 +32,7 @@ no `restic` binary is needed.
 |---|---|
 | `~/.config/restic-gtk/repos.json` | Repository names and locations, mode `0600` (locations may contain rest-server credentials). Never repository passwords. |
 | `~/.cache/restic-gtk/` | rustic's cache of encrypted index and snapshot files |
-| `$XDG_RUNTIME_DIR/restic-gtk/` | Files opened from snapshots, removed on quit |
+| `$XDG_RUNTIME_DIR/restic-gtk/` | Files opened from snapshots, removed on quit. Without `XDG_RUNTIME_DIR` (`sudo`, SSH) `~/.cache/restic-gtk/opened/`, never the shared `/tmp`. |
 
 ## Usage
 
