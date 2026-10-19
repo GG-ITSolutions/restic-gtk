@@ -21,7 +21,7 @@ impl UnlockDialog {
         let dialog: Self = glib::Object::new();
         let imp = dialog.imp();
         imp.description_label.set_label(&format!(
-            "Enter the password of “{}”. It is kept in memory only, until you lock the repository or quit.",
+            "Enter the password of “{}”. It is not stored; until you lock the repository or quit, only the unlocked key is kept in memory.",
             repo.name()
         ));
         imp.repo.replace(Some(repo.clone()));
