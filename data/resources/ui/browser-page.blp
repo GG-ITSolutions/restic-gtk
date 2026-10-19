@@ -9,6 +9,13 @@ template $ResticGtkBrowserPage: Adw.NavigationPage {
     [top]
     Adw.HeaderBar {
       title-widget: Adw.WindowTitle window_title {};
+
+      [end]
+      Gtk.Button {
+        icon-name: "dialog-information-symbolic";
+        tooltip-text: _("Snapshot Details");
+        action-name: "browser.details";
+      }
     }
 
     [top]

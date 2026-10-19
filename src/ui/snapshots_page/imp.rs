@@ -8,6 +8,7 @@ use crate::ui::{
     browser_page::BrowserPage,
     format::{self, DateGroup},
     objects::RepoObject,
+    repo_info_dialog::RepoInfoDialog,
     run_blocking,
     unlock_dialog::UnlockDialog,
 };
@@ -19,6 +20,8 @@ pub struct SnapshotsPage {
     window_title: TemplateChild<adw::WindowTitle>,
     #[template_child]
     lock_button: TemplateChild<gtk::Button>,
+    #[template_child]
+    details_button: TemplateChild<gtk::Button>,
     #[template_child]
     reload_button: TemplateChild<gtk::Button>,
     #[template_child]
@@ -51,6 +54,9 @@ impl ObjectSubclass for SnapshotsPage {
             page.imp().repo().lock()
         });
         klass.install_action("snapshots.reload", None, |page, _, _| page.imp().reload());
+        klass.install_action("snapshots.details", None, |page, _, _| {
+            RepoInfoDialog::show(page, page.imp().repo())
+        });
     }
 
     fn instance_init(obj: &glib::subclass::InitializingObject<Self>) {
@@ -106,6 +112,7 @@ impl SnapshotsPage {
     fn on_lock_changed(&self) {
         let unlocked = self.repo().unlocked();
         self.lock_button.set_visible(unlocked);
+        self.details_button.set_visible(unlocked);
         self.reload_button.set_visible(unlocked);
         if unlocked {
             self.reload();
@@ -213,7 +220,7 @@ impl SnapshotsPage {
             .build();
 
         let details = gtk::Box::builder().spacing(12).build();
-        if let Some(size) = snapshot.size {
+        if let Some(size) = snapshot.size() {
             details.append(&dim_label(&format::size(size), &["numeric"]));
         }
         details.append(&dim_label(snapshot.short_id(), &["monospace"]));

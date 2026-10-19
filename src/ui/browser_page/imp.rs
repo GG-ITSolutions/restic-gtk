@@ -17,6 +17,7 @@ use crate::ui::{
     path_bar::PathBar,
     restore_dialog::RestoreDialog,
     run_blocking, show_toast,
+    snapshot_info_dialog::SnapshotInfoDialog,
 };
 
 /// How long a folder may take to load before the spinner shows, to avoid flicker.
@@ -75,6 +76,9 @@ impl ObjectSubclass for BrowserPage {
         });
         klass.install_action("browser.restore", None, |page, _, _| {
             page.imp().restore_selected()
+        });
+        klass.install_action("browser.details", None, |page, _, _| {
+            SnapshotInfoDialog::show(page, page.imp().snapshot())
         });
         klass.add_binding_action(gdk::Key::Up, gdk::ModifierType::ALT_MASK, "browser.go-up");
         klass.add_binding_action(

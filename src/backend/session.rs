@@ -24,7 +24,7 @@ pub(crate) type IndexedRepo = Repository<IndexedFullStatus>;
 /// between threads with an `Arc`.
 #[derive(Debug)]
 pub struct Session {
-    repo: Repository<OpenStatus>,
+    pub(crate) repo: Repository<OpenStatus>,
     backends: RepositoryBackends,
     options: RepositoryOptions,
     /// Loaded on first use; browsing, extracting and restoring need it.

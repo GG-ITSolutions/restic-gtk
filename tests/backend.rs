@@ -105,8 +105,46 @@ fn snapshots_are_newest_first() {
     assert_eq!(snapshots.len(), 2);
     assert!(snapshots[0].time > snapshots[1].time);
     assert_eq!(snapshots[0].paths, ["/data"]);
+    assert_eq!(snapshots[0].id.len(), 64);
     assert_eq!(snapshots[0].short_id().len(), 8);
-    assert!(snapshots[0].size.is_some_and(|size| size > 0));
+    assert!(snapshots[0].size().is_some_and(|size| size > 0));
+}
+
+// --- stats ---------------------------------------------------------------
+
+#[test]
+fn snapshots_carry_backup_summary() {
+    let fixture = Fixture::new();
+    let snapshots = fixture.open().snapshots().unwrap();
+    let newest = snapshots[0].summary.as_ref().unwrap();
+    let first = snapshots[1].summary.as_ref().unwrap();
+
+    // readme.txt, deep.txt, größe.txt and the symlink.
+    assert_eq!(first.total_files, 4);
+    assert_eq!(first.files_new, 4);
+    assert!(first.data_added > 0);
+    assert!(first.data_added_packed > 0);
+    assert!(first.backup_end >= first.backup_start);
+    assert!(snapshots[0].program_version.starts_with("rustic"));
+
+    assert_eq!(newest.total_files, 4);
+    assert_eq!(newest.total_bytes, first.total_bytes);
+}
+
+#[test]
+fn repo_stats_count_files_and_data() {
+    let fixture = Fixture::new();
+    let stats = fixture.open().repo_stats().unwrap();
+
+    assert_eq!(stats.id.len(), 64);
+    assert_eq!(stats.version, 2);
+    assert_eq!(stats.snapshots, 2);
+    assert!(stats.packs > 0);
+    assert!(stats.raw_size > 0);
+    assert!(stats.packed_size > 0);
+    // Packs are only part of the repository files.
+    assert!(stats.stored_size > stats.packed_size);
+    assert!(stats.compression_ratio().is_some());
 }
 
 // --- browsing ------------------------------------------------------------

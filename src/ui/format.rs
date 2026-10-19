@@ -1,10 +1,33 @@
 //! User-facing formatting of sizes and times.
 
+use std::time::Duration;
+
 use gtk::glib;
 use restic_gtk::backend::jiff::{Timestamp, ToSpan, Zoned, civil::Date, tz::TimeZone};
 
 pub fn size(bytes: u64) -> String {
     glib::format_size(bytes).into()
+}
+
+/// `n` with the matching noun, e.g. “1 file”, “3 files”.
+pub fn count(n: u64, singular: &str, plural: &str) -> String {
+    if n == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{n} {plural}")
+    }
+}
+
+/// A duration in its two largest units, e.g. “1 h 5 min”, “12 s”.
+pub fn duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let (h, min, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    match (h, min) {
+        (0, 0) if secs == 0 => "less than 1 s".into(),
+        (0, 0) => format!("{s} s"),
+        (0, _) => format!("{min} min {s} s"),
+        _ => format!("{h} h {min} min"),
+    }
 }
 
 fn local(time: &Zoned) -> Zoned {
@@ -124,6 +147,15 @@ mod tests {
                 title: "December 2025".into()
             }
         );
+    }
+
+    #[test]
+    fn durations_show_two_units() {
+        let secs = Duration::from_secs;
+        assert_eq!(duration(Duration::from_millis(300)), "less than 1 s");
+        assert_eq!(duration(secs(12)), "12 s");
+        assert_eq!(duration(secs(125)), "2 min 5 s");
+        assert_eq!(duration(secs(3900)), "1 h 5 min");
     }
 
     #[test]

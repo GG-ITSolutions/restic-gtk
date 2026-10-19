@@ -17,6 +17,13 @@ template $ResticGtkSnapshotsPage: Adw.NavigationPage {
       }
 
       [end]
+      Gtk.Button details_button {
+        icon-name: "dialog-information-symbolic";
+        tooltip-text: _("Repository Details");
+        action-name: "snapshots.details";
+      }
+
+      [end]
       Gtk.Button reload_button {
         icon-name: "view-refresh-symbolic";
         tooltip-text: _("Reload");

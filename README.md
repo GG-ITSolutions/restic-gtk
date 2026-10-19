@@ -14,6 +14,11 @@ no `restic` binary is needed.
   the decrypted key stays in memory, until you lock the repository or quit.
 - **Snapshots** grouped by date (Today, Yesterday, This Week, by month) with host, paths,
   tags, size and id.
+- **Repository details**: size on storage, unique data after deduplication, compression,
+  number of snapshots and pack files.
+- **Snapshot details**: host, user, paths, tags, full id, creating program and, if the
+  snapshot records it (restic ≥ 0.17, rustic), the backup summary: size, new/changed/unchanged
+  files, data added to the repository and duration.
 - **File browser** per snapshot with path bar and keyboard navigation (Enter, Alt+↑, Backspace).
 - **Open** a file with its default app. It is extracted read-only to
   `$XDG_RUNTIME_DIR/restic-gtk/` and removed when the app quits.

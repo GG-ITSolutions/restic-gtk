@@ -7,6 +7,7 @@ use restic_gtk::{backend::RepoStore, config};
 use crate::ui::{
     objects::{RepoList, RepoObject},
     repo_dialog::RepoDialog,
+    repo_info_dialog::RepoInfoDialog,
     restore_dialog::RestoreDialog,
     show_toast,
     snapshots_page::SnapshotsPage,
@@ -51,6 +52,11 @@ impl ObjectSubclass for ResticGtkWindow {
         });
         klass.install_action("win.edit-repository", None, |win, _, _| {
             win.imp().edit_repository()
+        });
+        klass.install_action("win.repository-details", None, |win, _, _| {
+            if let Some(repo) = win.imp().action_target() {
+                RepoInfoDialog::show(win, &repo);
+            }
         });
         klass.install_action("win.lock-repository", None, |win, _, _| {
             if let Some(repo) = win.imp().action_target() {
@@ -123,10 +129,9 @@ impl ObjectImpl for ResticGtkWindow {
             move |_, item| {
                 let imp = obj.imp();
                 let repo = item.and_then(|item| imp.repos().get(item.section_index()));
-                obj.action_set_enabled(
-                    "win.lock-repository",
-                    repo.as_ref().is_some_and(RepoObject::unlocked),
-                );
+                let unlocked = repo.as_ref().is_some_and(RepoObject::unlocked);
+                obj.action_set_enabled("win.repository-details", unlocked);
+                obj.action_set_enabled("win.lock-repository", unlocked);
                 imp.menu_target.replace(repo);
             }
         ));

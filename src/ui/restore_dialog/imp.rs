@@ -82,7 +82,7 @@ impl RestoreDialog {
                     Ok(preview) if preview.conflicts > 0 => {
                         imp.confirm_status.set_description(Some(&format!(
                             "{} in “{}” will be replaced by the version from the snapshot",
-                            files(preview.conflicts),
+                            format::count(preview.conflicts, "file", "files"),
                             request.target.display()
                         )));
                         imp.pending.replace(Some((session, snapshot, request)));
@@ -100,7 +100,7 @@ impl RestoreDialog {
         obj.set_can_close(false);
         self.progress_title.set_label(&format!(
             "Restoring {} to “{}”",
-            items(request.items.len()),
+            format::count(request.items.len() as u64, "item", "items"),
             request.target.display()
         ));
         self.show_progress(None);
@@ -163,22 +163,6 @@ impl RestoreDialog {
     fn show_error(&self, message: &str) {
         self.error_status.set_description(Some(message));
         self.stack.set_visible_child_name("error");
-    }
-}
-
-fn files(n: u64) -> String {
-    if n == 1 {
-        "1 file".into()
-    } else {
-        format!("{n} files")
-    }
-}
-
-fn items(n: usize) -> String {
-    if n == 1 {
-        "1 item".into()
-    } else {
-        format!("{n} items")
     }
 }
 
