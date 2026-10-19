@@ -83,9 +83,10 @@ impl RepoObject {
             .expect("RepoObject has a config")
     }
 
-    /// Replaces the configuration. A changed location locks the repository.
+    /// Replaces the configuration. A changed location or backend option locks the repository.
     pub fn set_config(&self, config: RepoConfig) {
-        let location_changed = self.config().location != config.location;
+        let old = self.config();
+        let location_changed = old.location != config.location || old.options != config.options;
         self.imp().config.replace(Some(config));
         self.notify_name();
         self.notify_display_location();

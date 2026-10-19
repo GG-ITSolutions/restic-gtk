@@ -40,19 +40,75 @@ template $ResticGtkRepoDialog: Adw.Dialog {
       margin-end: 12;
 
       Adw.PreferencesGroup {
-        description: _("A rest-server URL such as rest:https://user:password@host/repository/ or the path of a local repository. The repository password is asked for when unlocking and never stored.");
-
         Adw.EntryRow name_row {
           title: _("Name");
           activates-default: true;
           changed => $on_changed() swapped;
         }
 
+        Adw.ComboRow type_row {
+          title: _("Type");
+          notify::selected => $on_type_changed() swapped;
+
+          model: Gtk.StringList {
+            strings [
+              _("Local or rest-server"),
+              _("S3"),
+            ]
+          };
+        }
+      }
+
+      Adw.PreferencesGroup location_group {
+        description: _("A rest-server URL such as rest:https://user:password@host/repository/ or the path of a local repository. A restic URL such as s3:https://host/bucket/path switches to S3. The repository password is asked for when unlocking and never stored.");
+
         Adw.EntryRow location_row {
           title: _("Location");
           activates-default: true;
           input-purpose: url;
+          changed => $on_location_changed() swapped;
+        }
+      }
+
+      Adw.PreferencesGroup s3_group {
+        visible: false;
+        description: _("Amazon S3 or an S3-compatible service. Leave the region empty unless the service needs it, AWS does. The secret key and the repository password are asked for when unlocking and never stored.");
+
+        Adw.EntryRow endpoint_row {
+          title: _("Endpoint");
+          activates-default: true;
+          input-purpose: url;
           changed => $on_changed() swapped;
+        }
+
+        Adw.EntryRow bucket_row {
+          title: _("Bucket");
+          activates-default: true;
+          changed => $on_changed() swapped;
+        }
+
+        Adw.EntryRow root_row {
+          title: _("Path in Bucket");
+          activates-default: true;
+          changed => $on_changed() swapped;
+        }
+
+        Adw.EntryRow region_row {
+          title: _("Region");
+          activates-default: true;
+          changed => $on_changed() swapped;
+        }
+
+        Adw.EntryRow access_key_row {
+          title: _("Access Key ID");
+          activates-default: true;
+          changed => $on_changed() swapped;
+        }
+
+        Adw.SwitchRow virtual_host_row {
+          title: _("Virtual-Host Style");
+          subtitle: _("Address the bucket as bucket.host, some services need it");
+          notify::active => $on_changed() swapped;
         }
       }
 

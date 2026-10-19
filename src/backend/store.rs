@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, DirBuilder, OpenOptions},
     io::{self, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
@@ -9,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 
-use super::{Error, Result};
+use super::{Error, Result, S3Location};
 
 /// Stable identity of a repository entry, independent of name and location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -30,14 +31,17 @@ impl Default for RepoId {
 
 /// A repository as configured by the user.
 ///
-/// Never contains the repository password. The location may contain HTTP
-/// basic-auth credentials for a rest-server (`rest:https://user:pass@host/repo/`),
+/// Never contains the repository password or an S3 secret key. The location may contain
+/// HTTP basic-auth credentials for a rest-server (`rest:https://user:pass@host/repo/`),
 /// which is why the store file is only readable by the user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoConfig {
     pub id: RepoId,
     pub name: String,
     pub location: String,
+    /// Backend options, e.g. bucket and endpoint of an S3 repository, see [`S3Location`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: BTreeMap<String, String>,
 }
 
 impl RepoConfig {
@@ -46,11 +50,16 @@ impl RepoConfig {
             id: RepoId::new(),
             name: name.into(),
             location: location.into(),
+            options: BTreeMap::new(),
         }
     }
 
     /// The location with a basic-auth password replaced by `***`, for display.
+    /// S3 repositories are shown as `s3:https://host/bucket/path`.
     pub fn display_location(&self) -> String {
+        if let Some(s3) = S3Location::from_config(self) {
+            return s3.display();
+        }
         let Some(rest) = self.location.strip_prefix("rest:") else {
             return self.location.clone();
         };
@@ -72,6 +81,9 @@ pub fn validate_location(location: &str) -> Result<(), String> {
     let location = location.trim();
     if location.is_empty() {
         return Err("Enter a location".into());
+    }
+    if location.starts_with("s3:") {
+        return Err("Choose S3 as type".into());
     }
     if let Some(rest) = location.strip_prefix("rest:") {
         let url = Url::parse(rest).map_err(|_| "Not a valid URL".to_string())?;
@@ -97,7 +109,8 @@ struct StoreFile {
     repositories: Vec<RepoConfig>,
 }
 
-const STORE_VERSION: u32 = 1;
+/// 2 added `options`; version 1 files read the same.
+const STORE_VERSION: u32 = 2;
 
 /// The persisted repository list (`repos.json`).
 #[derive(Debug, Clone)]

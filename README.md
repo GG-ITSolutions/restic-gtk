@@ -8,10 +8,13 @@ no `restic` binary is needed.
 
 ## Features
 
-- **Repository list** in the sidebar: add, edit, remove. Local paths and rest-servers
-  (`rest:https://user:password@host/repository/`).
-- **Unlock per repository**: the password is asked for and never stored. After unlocking only
-  the decrypted key stays in memory, until you lock the repository or quit.
+- **Repository list** in the sidebar: add, edit, remove. Local paths, rest-servers
+  (`rest:https://user:password@host/repository/`) and S3 or S3-compatible storage (AWS, Hetzner,
+  Wasabi, MinIO, …) with endpoint, bucket, path, region and access key ID. Pasting a restic URL
+  such as `s3:https://host/bucket/path` fills in the S3 fields.
+- **Unlock per repository**: the password, and for S3 the secret key, is asked for and never
+  stored. After unlocking only the decrypted key, and the secret key, stay in memory, until you
+  lock the repository or quit.
 - **Snapshots** grouped by date (Today, Yesterday, This Week, by month) with host, paths,
   tags, size and id.
 - **Repository details**: size on storage, unique data after deduplication, compression,
@@ -31,7 +34,7 @@ no `restic` binary is needed.
 
 | Path | Content |
 |---|---|
-| `~/.config/restic-gtk/repos.json` | Repository names and locations, mode `0600` (locations may contain rest-server credentials). Never repository passwords. An invalid file is moved to `repos.json.broken`; an unreadable one is kept and the list is not saved until restart. |
+| `~/.config/restic-gtk/repos.json` | Repository names, locations and S3 settings, mode `0600` (locations may contain rest-server credentials). Never repository passwords or S3 secret keys. An invalid file is moved to `repos.json.broken`; an unreadable one is kept and the list is not saved until restart. |
 | `~/.cache/restic-gtk/` | rustic's cache of encrypted index and snapshot files |
 | `$XDG_RUNTIME_DIR/restic-gtk/` | Files opened from snapshots, removed on quit. Without `XDG_RUNTIME_DIR` (`sudo`, SSH) `~/.cache/restic-gtk/opened/`, never the shared `/tmp`. |
 
@@ -60,5 +63,9 @@ New files must be known to git (`git add`), otherwise the flake doesn't see them
 
 ## Known limitations
 
+- S3 settings come only from the dialog, never from `AWS_*` variables or `~/.aws`. AWS needs the
+  region of the bucket unless the endpoint names it (`s3.eu-central-1.amazonaws.com`); other
+  services work with an empty region.
+- An unreachable endpoint fails only after about a minute, rustic retries every request.
 - A running restore can't be cancelled; rustic_core offers no way to abort it.
 - Restoring to non-UTF-8 target paths is not supported.

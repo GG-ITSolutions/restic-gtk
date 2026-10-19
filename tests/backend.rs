@@ -9,9 +9,27 @@ use std::{
 
 use common::{Fixture, write};
 use restic_gtk::backend::{
-    EntryKind, Error, ProgressKind, ProgressUpdate, RepoConfig, RepoStore, RestoreRequest, Session,
-    validate_location,
+    EntryKind, Error, ProgressKind, ProgressUpdate, RepoConfig, RepoStore, RestoreRequest,
+    S3_LOCATION, S3Location, Session, validate_location,
 };
+
+/// An S3-compatible repository as entered in the dialog.
+fn s3_location() -> S3Location {
+    S3Location {
+        endpoint: "http://127.0.0.1:8333".into(),
+        bucket: "backups".into(),
+        root: "host/repo".into(),
+        access_key_id: "KEY".into(),
+        ..S3Location::default()
+    }
+}
+
+fn s3_config() -> RepoConfig {
+    RepoConfig {
+        options: s3_location().to_options(),
+        ..RepoConfig::new("S3", S3_LOCATION)
+    }
+}
 
 fn mode(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -44,6 +62,36 @@ fn store_round_trips_and_is_private() {
     assert_eq!(store.load().unwrap(), repos);
     assert_eq!(mode(store.path()), 0o600);
     assert_eq!(mode(store.path().parent().unwrap()), 0o700);
+}
+
+#[test]
+fn store_keeps_s3_options_without_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = RepoStore::new(dir.path());
+    let repos = vec![s3_config()];
+    store.save(&repos).unwrap();
+
+    assert_eq!(store.load().unwrap(), repos);
+    let text = fs::read_to_string(store.path()).unwrap();
+    assert!(text.contains("\"bucket\": \"backups\""), "{text}");
+    assert!(!text.contains("secret"), "{text}");
+}
+
+#[test]
+fn version_1_store_loads_without_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = RepoStore::new(dir.path());
+    fs::write(
+        store.path(),
+        r#"{"version": 1, "repositories": [
+            {"id": "6f3f2b0e-4a8e-4c1e-9d2a-3b5c7d9e1f20", "name": "Local", "location": "/srv/restic"}
+        ]}"#,
+    )
+    .unwrap();
+
+    let repos = store.load().unwrap();
+    assert_eq!(repos[0].location, "/srv/restic");
+    assert!(repos[0].options.is_empty());
 }
 
 #[test]
@@ -89,6 +137,151 @@ fn display_location_hides_basic_auth_password() {
 }
 
 #[test]
+fn display_location_of_s3_is_restic_url() {
+    assert_eq!(
+        s3_config().display_location(),
+        "s3:http://127.0.0.1:8333/backups/host/repo"
+    );
+}
+
+#[test]
+fn s3_location_round_trips_through_options() {
+    let options = s3_location().to_options();
+    assert_eq!(options["root"], "/host/repo");
+    // Never from the environment, which differs per user and shell.
+    assert_eq!(options["region"], "auto");
+    assert_eq!(options["disable_config_load"], "true");
+    assert!(!options.contains_key("enable_virtual_host_style"));
+    assert_eq!(S3Location::from_config(&s3_config()), Some(s3_location()));
+
+    let with_style = S3Location {
+        region: "fsn1".into(),
+        virtual_host_style: true,
+        endpoint: "https://fsn1.your-objectstorage.com".into(),
+        ..s3_location()
+    };
+    let config = RepoConfig {
+        options: with_style.to_options(),
+        ..RepoConfig::new("S3", S3_LOCATION)
+    };
+    assert_eq!(S3Location::from_config(&config), Some(with_style));
+    assert_eq!(S3Location::from_config(&RepoConfig::new("x", "/srv")), None);
+}
+
+#[test]
+fn s3_region_comes_from_aws_endpoint() {
+    let aws = S3Location {
+        endpoint: "s3.eu-central-1.amazonaws.com".into(),
+        ..s3_location()
+    };
+    let options = aws.to_options();
+    assert_eq!(options["endpoint"], "https://s3.eu-central-1.amazonaws.com");
+    assert_eq!(options["region"], "eu-central-1");
+}
+
+#[test]
+fn validates_s3_locations() {
+    let ok = [
+        s3_location(),
+        S3Location {
+            endpoint: "fsn1.your-objectstorage.com/".into(),
+            root: String::new(),
+            ..s3_location()
+        },
+        S3Location {
+            endpoint: "https://s3.amazonaws.com".into(),
+            region: "eu-west-1".into(),
+            ..s3_location()
+        },
+        S3Location {
+            endpoint: "https://oss-cn-hangzhou.aliyuncs.com".into(),
+            virtual_host_style: true,
+            ..s3_location()
+        },
+    ];
+    for location in ok {
+        assert_eq!(location.validate(), Ok(()), "{location:?}");
+    }
+    let bad = [
+        S3Location {
+            bucket: " ".into(),
+            ..s3_location()
+        },
+        S3Location {
+            bucket: "backups/host".into(),
+            ..s3_location()
+        },
+        S3Location {
+            access_key_id: String::new(),
+            ..s3_location()
+        },
+        S3Location {
+            endpoint: "ftp://host".into(),
+            ..s3_location()
+        },
+        S3Location {
+            endpoint: "https://host/backups".into(),
+            ..s3_location()
+        },
+        S3Location {
+            endpoint: "https://s3.amazonaws.com".into(),
+            ..s3_location()
+        },
+        S3Location {
+            virtual_host_style: true,
+            ..s3_location()
+        },
+        S3Location {
+            endpoint: "https://host.example".into(),
+            bucket: "my.backups".into(),
+            virtual_host_style: true,
+            ..s3_location()
+        },
+    ];
+    for location in bad {
+        assert!(location.validate().is_err(), "{location:?}");
+    }
+}
+
+#[test]
+fn parses_restic_s3_urls() {
+    let parsed =
+        S3Location::parse_restic("s3:https://s3.eu-central-1.amazonaws.com/bucket/a/b/").unwrap();
+    assert_eq!(
+        parsed,
+        S3Location {
+            endpoint: "https://s3.eu-central-1.amazonaws.com".into(),
+            bucket: "bucket".into(),
+            root: "a/b".into(),
+            region: "eu-central-1".into(),
+            ..S3Location::default()
+        }
+    );
+    let parsed = S3Location::parse_restic(" s3:http://127.0.0.1:8333/testbucket/repo").unwrap();
+    assert_eq!(parsed.endpoint, "http://127.0.0.1:8333");
+    assert_eq!(parsed.root, "repo");
+    let parsed = S3Location::parse_restic("s3://minio.example/backups").unwrap();
+    assert_eq!(parsed.endpoint, "https://minio.example");
+    assert_eq!(
+        (parsed.bucket.as_str(), parsed.root.as_str()),
+        ("backups", "")
+    );
+    let parsed = S3Location::parse_restic("s3:s3.amazonaws.com/backups/repo").unwrap();
+    assert_eq!(parsed.endpoint, "https://s3.amazonaws.com");
+    assert_eq!(parsed.region, "");
+
+    for bad in [
+        "s3:host",
+        "s3:https://host/",
+        "s3:",
+        "rest:https://host/repo",
+        "/srv",
+    ] {
+        assert_eq!(S3Location::parse_restic(bad), None, "{bad}");
+    }
+}
+
+#[test]
 fn validates_locations() {
     for ok in [
         "rest:https://backup.example/host/",
@@ -116,16 +309,43 @@ fn validates_locations() {
 #[test]
 fn wrong_password_is_reported_as_such() {
     let fixture = Fixture::new();
-    let result = Session::open(&fixture.config, "wrong", &fixture.cache_dir());
+    let result = Session::open(&fixture.config, "wrong", None, &fixture.cache_dir());
     assert!(matches!(result, Err(Error::WrongPassword)), "{result:?}");
 }
 
 #[test]
-fn missing_repository_is_an_error() {
+fn backend_options_reach_the_backend() {
     let fixture = Fixture::new();
-    let config = RepoConfig::new("gone", fixture.dir.path().join("nothing").to_str().unwrap());
-    let result = Session::open(&config, common::PASSWORD, &fixture.cache_dir());
-    assert!(matches!(result, Err(Error::Repository(_))), "{result:?}");
+    // OpenDAL's file system service takes the folder only as option, like S3 takes the bucket.
+    let config = RepoConfig {
+        options: [("root".to_owned(), fixture.config.location.clone())].into(),
+        ..RepoConfig::new("fs", "opendal:fs")
+    };
+    let session = Session::open(&config, common::PASSWORD, None, &fixture.cache_dir()).unwrap();
+    assert_eq!(session.snapshots().unwrap().len(), 2);
+}
+
+#[test]
+fn missing_repository_is_reported_as_such() {
+    let fixture = Fixture::new();
+    let missing = fixture
+        .dir
+        .path()
+        .join("nothing")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let config = RepoConfig::new("gone", &missing);
+    let result = Session::open(&config, common::PASSWORD, None, &fixture.cache_dir());
+    assert!(matches!(result, Err(Error::NoRepository)), "{result:?}");
+
+    // Through OpenDAL, like a wrong bucket or path on S3.
+    let config = RepoConfig {
+        options: [("root".to_owned(), missing)].into(),
+        ..RepoConfig::new("gone", "opendal:fs")
+    };
+    let result = Session::open(&config, common::PASSWORD, None, &fixture.cache_dir());
+    assert!(matches!(result, Err(Error::NoRepository)), "{result:?}");
 }
 
 #[test]

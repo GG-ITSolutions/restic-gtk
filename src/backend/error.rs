@@ -9,6 +9,14 @@ pub enum Error {
     #[error("Wrong password")]
     WrongPassword,
 
+    /// The storage refused the credentials, e.g. a wrong S3 access key or secret key.
+    #[error("Access denied, check access key and secret key")]
+    AccessDenied,
+
+    /// The location has no repository config, e.g. a wrong path or S3 bucket.
+    #[error("No repository found at this location")]
+    NoRepository,
+
     #[error("“{0}” is not a folder")]
     NotADirectory(PathBuf),
 
@@ -42,8 +50,25 @@ impl From<Box<RusticError>> for Error {
     fn from(err: Box<RusticError>) -> Self {
         if err.is_incorrect_password() {
             Self::WrongPassword
+        } else if is_permission_denied(&err) {
+            Self::AccessDenied
         } else {
             Self::Repository(err.display_log())
         }
     }
+}
+
+/// Whether OpenDAL reported a refused request somewhere in the chain of `err`.
+fn is_permission_denied(err: &RusticError) -> bool {
+    let mut source = std::error::Error::source(err);
+    while let Some(err) = source {
+        if err
+            .downcast_ref::<opendal::Error>()
+            .is_some_and(|err| err.kind() == opendal::ErrorKind::PermissionDenied)
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }

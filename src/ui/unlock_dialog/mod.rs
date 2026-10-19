@@ -2,11 +2,12 @@ mod imp;
 
 use adw::{prelude::*, subclass::prelude::*};
 use gtk::glib;
+use restic_gtk::backend::S3_LOCATION;
 
 use crate::ui::objects::RepoObject;
 
 glib::wrapper! {
-    /// Asks for the password of a repository and opens it.
+    /// Asks for the password of a repository, and the secret key of S3 repositories, and opens it.
     ///
     /// Stays open while connecting and after a wrong password, so the password
     /// can be corrected in place.
@@ -20,10 +21,19 @@ impl UnlockDialog {
     pub async fn run(parent: &impl IsA<gtk::Widget>, repo: &RepoObject) -> bool {
         let dialog: Self = glib::Object::new();
         let imp = dialog.imp();
-        imp.description_label.set_label(&format!(
-            "Enter the password of “{}”. It is not stored; until you lock the repository or quit, only the unlocked key is kept in memory.",
-            repo.name()
-        ));
+        let s3 = repo.config().location == S3_LOCATION;
+        imp.description_label.set_label(&if s3 {
+            format!(
+                "Enter the password and the S3 secret key of “{}”. They are not stored; until you lock the repository or quit, only the unlocked key and the secret key are kept in memory.",
+                repo.name()
+            )
+        } else {
+            format!(
+                "Enter the password of “{}”. It is not stored; until you lock the repository or quit, only the unlocked key is kept in memory.",
+                repo.name()
+            )
+        });
+        imp.secret_row.set_visible(s3);
         imp.repo.replace(Some(repo.clone()));
 
         let (sender, receiver) = async_channel::bounded(1);

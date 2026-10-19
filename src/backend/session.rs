@@ -1,5 +1,6 @@
 use std::{
     cmp::Ordering,
+    collections::BTreeMap,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -13,6 +14,7 @@ use rustic_core::{
 use super::{
     Entry, Error, ProgressUpdate, RepoConfig, Result, Snapshot,
     progress::{ProgressCallback, ProgressRouter},
+    s3,
 };
 
 pub(crate) type IndexedRepo = Repository<IndexedFullStatus>;
@@ -25,6 +27,7 @@ pub(crate) type IndexedRepo = Repository<IndexedFullStatus>;
 #[derive(Debug)]
 pub struct Session {
     pub(crate) repo: Repository<OpenStatus>,
+    /// Holds an S3 secret key like `repo` holds the decrypted key, until the session is dropped.
     backends: RepositoryBackends,
     options: RepositoryOptions,
     /// Loaded on first use; browsing, extracting and restoring need it.
@@ -37,15 +40,28 @@ pub struct Session {
 impl Session {
     /// Connects to the repository and decrypts its key.
     ///
-    /// Fails with [`Error::WrongPassword`] if the password matches no key.
-    pub fn open(config: &RepoConfig, password: &str, cache_dir: &Path) -> Result<Self> {
+    /// `secret_key` is the secret access key of an S3 repository, ignored for others.
+    /// Fails with [`Error::WrongPassword`] if the password matches no key, with
+    /// [`Error::AccessDenied`] if the storage refuses the credentials and with
+    /// [`Error::NoRepository`] if there is no repository, e.g. a wrong bucket or path.
+    pub fn open(
+        config: &RepoConfig,
+        password: &str,
+        secret_key: Option<&str>,
+        cache_dir: &Path,
+    ) -> Result<Self> {
         let backends = BackendOptions::default()
             .repository(config.location.trim())
+            .options(backend_options(config, secret_key))
             .to_backends()?;
         let options = RepositoryOptions::default().cache_dir(cache_dir);
         let progress = ProgressRouter::default();
-        let repo = Repository::new_with_progress(&options, &backends, progress.clone())?
-            .open(&Credentials::password(password))?;
+        let repo = Repository::new_with_progress(&options, &backends, progress.clone())?;
+        // rustic reports this as a generic configuration error.
+        if repo.config_id()?.is_none() {
+            return Err(Error::NoRepository);
+        }
+        let repo = repo.open(&Credentials::password(password))?;
         Ok(Self {
             repo,
             backends,
@@ -151,9 +167,36 @@ impl Session {
     }
 }
 
+/// The stored options of `config`, plus the secret key for S3.
+fn backend_options(config: &RepoConfig, secret_key: Option<&str>) -> BTreeMap<String, String> {
+    let mut options = config.options.clone();
+    if let Some(secret_key) = secret_key.filter(|_| config.location == s3::LOCATION) {
+        options.insert(s3::SECRET_OPTION.to_owned(), secret_key.to_owned());
+    }
+    options
+}
+
 fn compare_entries(a: &Entry, b: &Entry) -> Ordering {
     b.is_dir()
         .cmp(&a.is_dir())
         .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         .then_with(|| a.name.cmp(&b.name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_key_is_only_added_for_s3() {
+        let mut config = RepoConfig::new("x", s3::LOCATION);
+        config.options.insert("bucket".into(), "b".into());
+        let options = backend_options(&config, Some("secret"));
+        assert_eq!(options["bucket"], "b");
+        assert_eq!(options[s3::SECRET_OPTION], "secret");
+        assert!(!backend_options(&config, None).contains_key(s3::SECRET_OPTION));
+
+        let local = RepoConfig::new("x", "/srv/restic");
+        assert!(backend_options(&local, Some("secret")).is_empty());
+    }
 }

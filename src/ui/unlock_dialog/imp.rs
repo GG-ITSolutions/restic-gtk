@@ -20,6 +20,9 @@ pub struct UnlockDialog {
     pub description_label: TemplateChild<gtk::Label>,
     #[template_child]
     pub password_row: TemplateChild<adw::PasswordEntryRow>,
+    /// The secret key of S3 repositories, hidden for others.
+    #[template_child]
+    pub secret_row: TemplateChild<adw::PasswordEntryRow>,
     #[template_child]
     pub error_label: TemplateChild<gtk::Label>,
 
@@ -50,6 +53,7 @@ impl UnlockDialog {
     #[template_callback]
     fn on_changed(&self) {
         self.password_row.remove_css_class("error");
+        self.secret_row.remove_css_class("error");
         self.update_sensitivity();
     }
 
@@ -71,13 +75,19 @@ impl UnlockDialog {
 
         let config = repo.config();
         let password = self.password_row.text().to_string();
+        let secret_key = self
+            .secret_row
+            .is_visible()
+            .then(|| self.secret_row.text().to_string());
         let cache_dir = config::cache_dir();
         glib::spawn_future_local(clone!(
             #[weak(rename_to = dialog)]
             self.obj(),
             async move {
-                let result =
-                    run_blocking(move || Session::open(&config, &password, &cache_dir)).await;
+                let result = run_blocking(move || {
+                    Session::open(&config, &password, secret_key.as_deref(), &cache_dir)
+                })
+                .await;
                 let imp = dialog.imp();
                 // Cancelled while connecting: the user no longer wants this unlocked.
                 let Some(sender) = imp.result.take() else {
@@ -87,6 +97,7 @@ impl UnlockDialog {
                 match result {
                     Ok(session) => {
                         imp.password_row.set_text("");
+                        imp.secret_row.set_text("");
                         repo.set_session(session);
                         let _ = sender.try_send(());
                         dialog.close();
@@ -107,25 +118,30 @@ impl UnlockDialog {
         self.unlock_stack
             .set_visible_child_name(if busy { "busy" } else { "label" });
         self.password_row.set_sensitive(!busy);
+        self.secret_row.set_sensitive(!busy);
         self.update_sensitivity();
     }
 
     fn update_sensitivity(&self) {
-        self.unlock_button
-            .set_sensitive(!self.busy.get() && !self.password_row.text().is_empty());
+        let secret_missing = self.secret_row.is_visible() && self.secret_row.text().is_empty();
+        self.unlock_button.set_sensitive(
+            !self.busy.get() && !self.password_row.text().is_empty() && !secret_missing,
+        );
     }
 
     fn show_error(&self, err: &Error) {
-        let message = match err {
-            Error::WrongPassword => "Wrong password".to_owned(),
-            err => format!("Could not open the repository: {err}"),
+        let (message, row) = match err {
+            Error::WrongPassword => ("Wrong password".to_owned(), Some(&*self.password_row)),
+            Error::AccessDenied => (err.to_string(), Some(&*self.secret_row)),
+            Error::NoRepository => (err.to_string(), None),
+            err => (format!("Could not open the repository: {err}"), None),
         };
         self.error_label.set_label(&message);
         self.error_label.set_visible(true);
-        if matches!(err, Error::WrongPassword) {
-            self.password_row.add_css_class("error");
-            self.password_row.grab_focus();
-            self.password_row.select_region(0, -1);
+        if let Some(row) = row {
+            row.add_css_class("error");
+            row.grab_focus();
+            row.select_region(0, -1);
         }
     }
 }

@@ -69,6 +69,13 @@ template $ResticGtkUnlockDialog: Adw.Dialog {
           activates-default: true;
           changed => $on_changed() swapped;
         }
+
+        Adw.PasswordEntryRow secret_row {
+          title: _("Secret Access Key");
+          visible: false;
+          activates-default: true;
+          changed => $on_changed() swapped;
+        }
       }
 
       Gtk.Label error_label {

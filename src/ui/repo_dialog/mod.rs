@@ -2,10 +2,10 @@ mod imp;
 
 use adw::{prelude::*, subclass::prelude::*};
 use gtk::glib;
-use restic_gtk::backend::RepoConfig;
+use restic_gtk::backend::{RepoConfig, S3Location};
 
 glib::wrapper! {
-    /// Adds a repository or edits name and location of an existing one.
+    /// Adds a repository or edits name and location of an existing one, local, rest-server or S3.
     pub struct RepoDialog(ObjectSubclass<imp::RepoDialog>)
         @extends adw::Dialog, gtk::Widget,
         @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget, gtk::ShortcutManager;
@@ -23,7 +23,13 @@ impl RepoDialog {
             dialog.set_title("Edit Repository");
             imp.save_button.set_label("_Save");
             imp.name_row.set_text(&config.name);
-            imp.location_row.set_text(&config.location);
+            match S3Location::from_config(config) {
+                Some(s3) => {
+                    imp.set_s3(&s3);
+                    imp.type_row.set_selected(imp::TYPE_S3);
+                }
+                None => imp.location_row.set_text(&config.location),
+            }
         } else {
             dialog.set_title("Add Repository");
             imp.save_button.set_label("_Add");

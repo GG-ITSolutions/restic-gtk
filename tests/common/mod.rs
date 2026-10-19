@@ -82,7 +82,7 @@ impl Fixture {
     }
 
     pub fn open(&self) -> Session {
-        Session::open(&self.config, PASSWORD, &self.cache_dir()).unwrap()
+        Session::open(&self.config, PASSWORD, None, &self.cache_dir()).unwrap()
     }
 
     /// The newest snapshot.
