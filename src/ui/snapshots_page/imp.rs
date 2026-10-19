@@ -9,7 +9,7 @@ use crate::ui::{
     details,
     format::{self, DateGroup},
     objects::RepoObject,
-    run_blocking,
+    run_blocking, set_plain_description,
     unlock_dialog::UnlockDialog,
 };
 
@@ -169,7 +169,7 @@ impl SnapshotsPage {
                         imp.stack.set_visible_child_name("list");
                     }
                     Err(err) => {
-                        imp.error_status.set_description(Some(&err.to_string()));
+                        set_plain_description(&imp.error_status, &err.to_string());
                         imp.stack.set_visible_child_name("error");
                         return;
                     }

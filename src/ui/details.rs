@@ -4,7 +4,7 @@ use adw::prelude::*;
 use gtk::{glib, glib::clone};
 use restic_gtk::backend::{RepoStats, Snapshot, SnapshotSummary};
 
-use crate::ui::{format, objects::RepoObject, run_blocking};
+use crate::ui::{format, objects::RepoObject, run_blocking, set_plain_description};
 
 /// Shows a snapshot and the summary of the backup that created it.
 pub fn show_snapshot(parent: &impl IsA<gtk::Widget>, snapshot: &Snapshot) {
@@ -155,12 +155,12 @@ fn group(title: &str, rows: &[(&str, String)]) -> adw::PreferencesGroup {
 }
 
 fn status_page(title: &str, description: &str) -> adw::StatusPage {
-    adw::StatusPage::builder()
+    let status = adw::StatusPage::builder()
         .title(title)
-        // Status pages take markup, error messages may contain “&”.
-        .description(glib::markup_escape_text(description))
         .css_classes(["compact"])
-        .build()
+        .build();
+    set_plain_description(&status, description);
+    status
 }
 
 /// Presents a dialog with `content`; returns its view to replace the content later.

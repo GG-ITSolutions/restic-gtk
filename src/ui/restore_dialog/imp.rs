@@ -4,7 +4,7 @@ use adw::{prelude::*, subclass::prelude::*};
 use gtk::{CompositeTemplate, glib, glib::clone};
 use restic_gtk::backend::{ProgressKind, ProgressUpdate, RestoreRequest, Session, Snapshot};
 
-use crate::ui::{format, run_blocking};
+use crate::ui::{format, run_blocking, set_plain_description};
 
 #[derive(Debug, Default, CompositeTemplate)]
 #[template(resource = "/de/gg_itsystemhaus/ResticGtk/ui/restore-dialog.ui")]
@@ -80,11 +80,14 @@ impl RestoreDialog {
                 }
                 match preview {
                     Ok(preview) if preview.conflicts > 0 => {
-                        imp.confirm_status.set_description(Some(&format!(
-                            "{} in “{}” will be replaced by the version from the snapshot",
-                            format::count(preview.conflicts, "file", "files"),
-                            request.target.display()
-                        )));
+                        set_plain_description(
+                            &imp.confirm_status,
+                            &format!(
+                                "{} in “{}” will be replaced by the version from the snapshot",
+                                format::count(preview.conflicts, "file", "files"),
+                                request.target.display()
+                            ),
+                        );
                         imp.pending.replace(Some((session, snapshot, request)));
                         imp.stack.set_visible_child_name("confirm");
                     }
@@ -161,7 +164,7 @@ impl RestoreDialog {
     }
 
     fn show_error(&self, message: &str) {
-        self.error_status.set_description(Some(message));
+        set_plain_description(&self.error_status, message);
         self.stack.set_visible_child_name("error");
     }
 }

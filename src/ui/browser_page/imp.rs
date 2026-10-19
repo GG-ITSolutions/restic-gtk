@@ -16,7 +16,7 @@ use crate::ui::{
     objects::{EntryObject, RepoObject},
     path_bar::PathBar,
     restore_dialog::RestoreDialog,
-    run_blocking, show_toast,
+    run_blocking, set_plain_description, show_toast,
 };
 
 /// How long a folder may take to load before the spinner shows, to avoid flicker.
@@ -188,7 +188,7 @@ impl BrowserPage {
         }
         let error = repo.index_error();
         if !error.is_empty() {
-            self.index_error_status.set_description(Some(&error));
+            set_plain_description(&self.index_error_status, &error);
             self.stack.set_visible_child_name("index-error");
             return;
         }
@@ -261,7 +261,7 @@ impl BrowserPage {
                     Err(err) => {
                         imp.entries.remove_all();
                         imp.show_path(&path);
-                        imp.error_status.set_description(Some(&err.to_string()));
+                        set_plain_description(&imp.error_status, &err.to_string());
                         imp.stack.set_visible_child_name("error");
                     }
                 }

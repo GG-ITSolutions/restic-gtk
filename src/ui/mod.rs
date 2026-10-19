@@ -24,6 +24,14 @@ pub async fn run_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'sta
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
+/// Sets the description of `status` to `text` as is.
+///
+/// Status pages take markup, so messages and paths containing “&” or “<” would
+/// otherwise be dropped with a warning.
+pub fn set_plain_description(status: &adw::StatusPage, text: &str) {
+    status.set_description(Some(&glib::markup_escape_text(text)));
+}
+
 /// Shows `toast` in the window containing `widget`.
 pub fn add_toast(widget: &impl IsA<gtk::Widget>, toast: adw::Toast) {
     if let Some(window) = widget.root().and_downcast::<ResticGtkWindow>() {
