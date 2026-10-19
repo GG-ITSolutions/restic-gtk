@@ -1,10 +1,14 @@
 use std::{
-    io,
+    fs, io,
+    os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use rustic_core::{LocalDestination, LsOptions, RestoreOptions, repofile::Node};
+use rustic_core::{
+    LocalDestination, LsOptions, RestoreOptions,
+    repofile::{Node, NodeType},
+};
 
 use super::{Error, ProgressKind, ProgressUpdate, Result, Session, Snapshot, session::IndexedRepo};
 
@@ -131,6 +135,7 @@ impl Session {
         Ok(())
     }
 
+    /// Finds the requested nodes and checks their places in the target, before anything is written.
     fn resolve(
         &self,
         repo: &IndexedRepo,
@@ -143,10 +148,57 @@ impl Session {
             .map(|path| {
                 let node = self.node(repo, snapshot, path)?;
                 let destination = request.target.join(node.name());
+                check_target(&destination, &node)?;
+                if node.is_dir() {
+                    for entry in repo.ls(&node, &LsOptions::default())? {
+                        let (path, node) = entry?;
+                        check_target(&destination.join(path), &node)?;
+                    }
+                }
                 Ok(Item { node, destination })
             })
             .collect()
     }
+}
+
+/// Fails if `path` holds something rustic can't restore `node` onto.
+///
+/// rustic_core replaces nothing of a different type without deleting everything else not in
+/// the snapshot as well, and follows symlinks it finds: it then writes outside of the target,
+/// skips the entry silently or panics.
+fn check_target(path: &Path, node: &Node) -> Result<()> {
+    let meta = match fs::symlink_metadata(path) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        meta => meta?,
+    };
+    let kind = meta.file_type();
+    let fits = match &node.node_type {
+        NodeType::Dir => kind.is_dir(),
+        NodeType::File => kind.is_file(),
+        NodeType::Symlink { .. } => {
+            kind.is_symlink() && fs::read_link(path)? == node.node_type.to_link()
+        }
+        NodeType::Dev { .. } => kind.is_block_device(),
+        NodeType::Chardev { .. } => kind.is_char_device(),
+        NodeType::Fifo => kind.is_fifo(),
+        NodeType::Socket => kind.is_socket(),
+    };
+    if fits {
+        return Ok(());
+    }
+    let existing = if kind.is_symlink() {
+        "a link"
+    } else if kind.is_dir() {
+        "a folder"
+    } else if kind.is_file() {
+        "a file"
+    } else {
+        "a special file"
+    };
+    Err(Error::TargetExists {
+        path: path.to_path_buf(),
+        existing,
+    })
 }
 
 impl Item {

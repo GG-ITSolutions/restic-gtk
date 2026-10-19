@@ -2,7 +2,7 @@ mod common;
 
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -328,4 +328,81 @@ fn preview_counts_files_that_would_be_overwritten() {
         fs::read_to_string(target.join("docs/readme.txt")).unwrap(),
         "hello\n"
     );
+}
+
+#[test]
+fn restore_refuses_entries_of_another_type_in_target() {
+    let fixture = Fixture::new();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let outside = fixture.folder("outside");
+    write(&outside.join("victim.txt"), "victim\n");
+
+    type Setup = fn(&Path, &Path);
+    let cases: [(&str, &str, &str, Setup); 7] = [
+        ("/data/größe.txt", "größe.txt", "a folder", |t, _| {
+            fs::create_dir(t.join("größe.txt")).unwrap()
+        }),
+        ("/data/docs", "docs", "a file", |t, _| {
+            write(&t.join("docs"), "mine\n")
+        }),
+        ("/data/docs", "docs/sub", "a file", |t, _| {
+            write(&t.join("docs/sub"), "mine\n")
+        }),
+        ("/data/docs", "docs/readme.txt", "a folder", |t, _| {
+            fs::create_dir_all(t.join("docs/readme.txt")).unwrap()
+        }),
+        // rustic would follow these and write outside of the target.
+        ("/data/docs", "docs", "a link", |t, o| {
+            symlink(o, t.join("docs")).unwrap()
+        }),
+        ("/data/docs", "docs/readme.txt", "a link", |t, o| {
+            fs::create_dir(t.join("docs")).unwrap();
+            symlink(o.join("victim.txt"), t.join("docs/readme.txt")).unwrap()
+        }),
+        ("/data/link", "link", "a file", |t, _| {
+            write(&t.join("link"), "mine\n")
+        }),
+    ];
+    for (i, (item, clash, existing, setup)) in cases.into_iter().enumerate() {
+        let target = fixture.folder(&format!("target-{i}"));
+        setup(&target, &outside);
+        let request = RestoreRequest {
+            items: vec![item.into()],
+            target: target.clone(),
+        };
+        for result in [
+            session.preview_restore(&snapshot, &request).map(|_| ()),
+            session.restore(&snapshot, &request, |_| {}),
+        ] {
+            match result {
+                Err(Error::TargetExists { path, existing: e }) => {
+                    assert_eq!(
+                        (path, e),
+                        (target.join(clash), existing),
+                        "{item} onto {clash}"
+                    )
+                }
+                other => panic!("{item} onto {clash}: {other:?}"),
+            }
+        }
+    }
+    assert_eq!(
+        fs::read_to_string(outside.join("victim.txt")).unwrap(),
+        "victim\n"
+    );
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+}
+
+#[test]
+fn restoring_the_same_entries_again_is_no_clash() {
+    let fixture = Fixture::new();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let request = RestoreRequest {
+        items: vec!["/data/docs".into(), "/data/link".into()],
+        target: fixture.folder("target"),
+    };
+    session.restore(&snapshot, &request, |_| {}).unwrap();
+    session.restore(&snapshot, &request, |_| {}).unwrap();
 }

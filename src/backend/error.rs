@@ -15,6 +15,13 @@ pub enum Error {
     #[error("“{0}” is not a regular file")]
     NotAFile(PathBuf),
 
+    /// The restore target has something else where an entry goes.
+    #[error("“{path}” already exists as {existing}")]
+    TargetExists {
+        path: PathBuf,
+        existing: &'static str,
+    },
+
     #[error("Invalid repository list: {0}")]
     Store(#[from] serde_json::Error),
 

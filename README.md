@@ -24,7 +24,8 @@ no `restic` binary is needed.
   `$XDG_RUNTIME_DIR/restic-gtk/` and removed when the app quits.
 - **Restore** selected files and folders into a folder of your choice, as
   `<folder>/<name>`. Existing files that would be replaced are listed first, then the
-  restore shows its progress.
+  restore shows its progress. A folder, file or link of another type in the way stops the
+  restore before anything is written.
 
 ## Files
 
