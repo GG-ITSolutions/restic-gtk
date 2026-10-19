@@ -23,6 +23,25 @@ pub enum Error {
     #[error("“{0}” is not a regular file")]
     NotAFile(PathBuf),
 
+    #[error("“{0}” does not exist")]
+    NotFound(PathBuf),
+
+    /// A file inside a disk image whose contents can't be read, e.g. an encrypted one.
+    #[error("“{path}” can't be opened. {reason}")]
+    UnsupportedFile { path: PathBuf, reason: String },
+
+    /// A partition of a disk image without a filesystem that can be browsed.
+    #[error("{0}")]
+    UnsupportedFilesystem(String),
+
+    /// Disk images and the snapshot paths inside them can't be restored, only opened.
+    #[error("Files inside disk images can't be restored, only opened")]
+    RestoreFromImage,
+
+    /// A disk image that can't be read, e.g. a damaged filesystem.
+    #[error("{0}")]
+    Image(String),
+
     /// The restore target has something else where an entry goes.
     #[error("“{path}” already exists as {existing}")]
     TargetExists {

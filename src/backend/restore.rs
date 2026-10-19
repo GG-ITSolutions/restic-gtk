@@ -10,7 +10,10 @@ use rustic_core::{
     repofile::{Node, NodeType},
 };
 
-use super::{Error, ProgressKind, ProgressUpdate, Result, Session, Snapshot, session::IndexedRepo};
+use super::{
+    Error, ProgressKind, ProgressUpdate, Result, Session, Snapshot,
+    session::{IndexedRepo, Location},
+};
 
 /// Entries of one snapshot to restore into a folder.
 ///
@@ -146,7 +149,14 @@ impl Session {
             .items
             .iter()
             .map(|path| {
-                let node = self.node(repo, snapshot, path)?;
+                // A disk image file restores as a file, but nothing inside it.
+                let node = match self.locate(repo, snapshot, path)? {
+                    Location::Node(node) => node,
+                    Location::Image { node, inner, .. } if inner.components().next().is_none() => {
+                        node
+                    }
+                    Location::Image { .. } => return Err(Error::RestoreFromImage),
+                };
                 let destination = request.target.join(node.name());
                 check_target(&destination, &node)?;
                 if node.is_dir() {

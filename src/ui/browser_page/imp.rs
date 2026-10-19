@@ -7,7 +7,7 @@ use std::{
 use adw::{prelude::*, subclass::prelude::*};
 use gtk::{CompositeTemplate, gdk, gio, glib, glib::clone};
 use restic_gtk::{
-    backend::{EntryKind, RestoreRequest, Snapshot, jiff::Timestamp},
+    backend::{EntryKind, RestoreRequest, Snapshot, is_disk_image, jiff::Timestamp},
     config,
 };
 
@@ -199,9 +199,14 @@ impl BrowserPage {
     }
 
     /// Starts in the backed up folder if there is exactly one, which is where the files are.
+    ///
+    /// Not in a disk image though: the other files of the snapshot, e.g. a
+    /// `system.json` next to it, would be out of sight.
     fn load_start_folder(&self) {
         match self.snapshot().paths.as_slice() {
-            [single] => self.load_dir(PathBuf::from(single), true),
+            [single] if !is_disk_image(Path::new(single)) => {
+                self.load_dir(PathBuf::from(single), true)
+            }
             _ => self.load_dir(PathBuf::from("/"), false),
         }
     }
@@ -295,11 +300,16 @@ impl BrowserPage {
         let selected = self.selected_entries();
         let openable = matches!(
             selected.as_slice(),
-            [entry] if matches!(entry.entry().kind, EntryKind::Dir | EntryKind::File)
+            [entry] if matches!(
+                entry.entry().kind,
+                EntryKind::Dir | EntryKind::File | EntryKind::DiskImage | EntryKind::Partition
+            )
         );
+        // Files inside disk images can only be opened.
+        let restorable = !selected.is_empty() && selected.iter().all(|e| !e.entry().inside_image);
         let obj = self.obj();
         obj.action_set_enabled("browser.open", openable);
-        obj.action_set_enabled("browser.restore", !selected.is_empty());
+        obj.action_set_enabled("browser.restore", restorable);
         self.selection_label.set_label(&match selected.len() {
             0 => String::new(),
             1 => "1 item selected".to_owned(),
@@ -316,7 +326,9 @@ impl BrowserPage {
     fn activate_entry(&self, entry: &EntryObject) {
         let entry = entry.entry();
         match &entry.kind {
-            EntryKind::Dir => self.load_dir(entry.path.clone(), false),
+            EntryKind::Dir | EntryKind::DiskImage | EntryKind::Partition => {
+                self.load_dir(entry.path.clone(), false)
+            }
             EntryKind::File => self.open_file(entry.path.clone()),
             EntryKind::Symlink { target } => show_toast(
                 &*self.obj(),
@@ -326,6 +338,9 @@ impl BrowserPage {
                 &*self.obj(),
                 &format!("“{}” is a special file and can't be opened", entry.name),
             ),
+            EntryKind::Unavailable { reason } => {
+                show_toast(&*self.obj(), &format!("“{}”: {reason}", entry.name))
+            }
         }
     }
 

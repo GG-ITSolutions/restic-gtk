@@ -25,6 +25,11 @@ no `restic` binary is needed.
 - **File browser** per snapshot with path bar and keyboard navigation (Enter, Alt+↑, Backspace).
 - **Open** a file with its default app. It is extracted read-only to
   `$XDG_RUNTIME_DIR/restic-gtk/` and removed when the app quits.
+- **Disk images** (`.img`, `.raw`, `.dd`) open like folders, without downloading them: first
+  the partitions (GPT or MBR), then the files of NTFS and FAT volumes. Opening a file reads only
+  its blocks; files Windows stores compressed (CompactOS/WOF with XPRESS or LZX, NTFS
+  compression) are decompressed. Drive letters come from the `system.json` that
+  `backup-windows` writes next to its images. Files inside images can be opened, not restored.
 - **Restore** selected files and folders into a folder of your choice, as
   `<folder>/<name>`. Before existing files are replaced, their number is shown and must be
   confirmed, then the restore shows its progress. A folder, file or link of another type in
@@ -48,6 +53,10 @@ cargo run            # inside the dev shell
 cargo test           # backend tests against real repositories created in temp folders
 ```
 
+`tests/real_image.rs` browses a real Windows image backup and is ignored by default; its
+module docs say how to run it. The fixtures in `tests/fixtures/` come with the scripts that
+generate them.
+
 New files must be known to git (`git add`), otherwise the flake doesn't see them.
 
 ## Layout
@@ -69,3 +78,9 @@ New files must be known to git (`git add`), otherwise the flake doesn't see them
 - An unreachable endpoint fails only after about a minute, rustic retries every request.
 - A running restore can't be cancelled; rustic_core offers no way to abort it.
 - Restoring to non-UTF-8 target paths is not supported.
+- Disk images: ext2/3/4 and LVM, BitLocker and LUKS, qcow2/VHD(X)/VMDK and compressed images
+  (`.img.gz`) can't be browsed yet. Changes still in the NTFS journal of an image of a running
+  system are not applied.
+- Fragmented files in disk images are slow to open: every scattered piece fetches a whole blob
+  (about 1 MiB) from the repository. Logs with NTFS compression are typical, a 79 MB Windows
+  CBS log took about 90 s from a rest-server over the internet.

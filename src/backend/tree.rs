@@ -5,6 +5,8 @@ use rustic_core::{
     repofile::{Node, NodeType},
 };
 
+use super::image;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryKind {
     Dir,
@@ -14,6 +16,14 @@ pub enum EntryKind {
     },
     /// Devices, fifos and sockets: listed, but can't be opened.
     Special,
+    /// A raw disk image, browsed like a folder of its partitions.
+    DiskImage,
+    /// A partition of a disk image, browsed like a folder.
+    Partition,
+    /// A partition of a disk image that can't be browsed, e.g. an encrypted one.
+    Unavailable {
+        reason: String,
+    },
 }
 
 /// One item of a folder inside a snapshot.
@@ -25,6 +35,8 @@ pub struct Entry {
     pub kind: EntryKind,
     pub size: u64,
     pub mtime: Option<Timestamp>,
+    /// Inside a disk image: can be opened, but not restored.
+    pub inside_image: bool,
 }
 
 impl Entry {
@@ -36,6 +48,7 @@ impl Entry {
         let name = node.name().to_string_lossy().into_owned();
         let kind = match &node.node_type {
             NodeType::Dir => EntryKind::Dir,
+            NodeType::File if image::is_image_name(node.name().as_ref()) => EntryKind::DiskImage,
             NodeType::File => EntryKind::File,
             symlink @ NodeType::Symlink { .. } => EntryKind::Symlink {
                 target: symlink.to_link().to_path_buf(),
@@ -49,6 +62,7 @@ impl Entry {
             kind,
             size: node.meta.size,
             mtime: node.meta.mtime,
+            inside_image: false,
         }
     }
 }

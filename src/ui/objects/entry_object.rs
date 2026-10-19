@@ -48,11 +48,17 @@ impl EntryObject {
                 EntryKind::File => "text-x-generic-symbolic",
                 EntryKind::Symlink { .. } => "emblem-symbolic-link-symbolic",
                 EntryKind::Special => "application-x-executable-symbolic",
+                EntryKind::DiskImage => "drive-harddisk-symbolic",
+                EntryKind::Partition => "drive-harddisk-system-symbolic",
+                EntryKind::Unavailable { .. } => "action-unavailable-symbolic",
             }
             .into(),
         );
         imp.size_label.replace(match entry.kind {
-            EntryKind::File => format::size(entry.size),
+            EntryKind::File
+            | EntryKind::DiskImage
+            | EntryKind::Partition
+            | EntryKind::Unavailable { .. } => format::size(entry.size),
             _ => String::new(),
         });
         imp.modified_label.replace(

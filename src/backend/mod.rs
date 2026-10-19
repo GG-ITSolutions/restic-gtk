@@ -5,6 +5,7 @@
 
 mod error;
 mod extract;
+mod image;
 mod progress;
 mod restore;
 mod s3;
@@ -17,6 +18,7 @@ mod tree;
 pub use rustic_core::{jiff, repofile::SnapshotSummary};
 
 pub use error::{Error, Result};
+pub use image::is_disk_image;
 pub use progress::{ProgressKind, ProgressUpdate};
 pub use restore::{RestorePreview, RestoreRequest};
 pub use s3::{LOCATION as S3_LOCATION, S3Location};

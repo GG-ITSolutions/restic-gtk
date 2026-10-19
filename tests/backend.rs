@@ -2,6 +2,7 @@ mod common;
 
 use std::{
     fs,
+    io::{Cursor, Read, Write},
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -656,4 +657,234 @@ fn restoring_the_same_entries_again_is_no_clash() {
     };
     session.restore(&snapshot, &request, |_| {}).unwrap();
     session.restore(&snapshot, &request, |_| {}).unwrap();
+}
+
+// --- disk images ---------------------------------------------------------
+
+const MIB: usize = 1 << 20;
+const IMAGE: &str = "/data/disk.img";
+
+/// GPT type GUIDs as stored on disk.
+const EFI_TYPE: [u8; 16] = [
+    0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b,
+];
+const BASIC_DATA_TYPE: [u8; 16] = [
+    0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7,
+];
+const LINUX_TYPE: [u8; 16] = [
+    0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4,
+];
+
+/// The NTFS volume of `tests/fixtures/generate-ntfs.sh`.
+fn ntfs_volume() -> Vec<u8> {
+    let file =
+        fs::File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ntfs.img.zst"))
+            .unwrap();
+    let mut volume = Vec::new();
+    ruzstd::decoding::StreamingDecoder::new(file)
+        .unwrap()
+        .read_to_end(&mut volume)
+        .unwrap();
+    volume
+}
+
+/// A FAT volume with `/EFI/BOOT/hello.txt`.
+fn fat_volume() -> Vec<u8> {
+    let mut volume = Cursor::new(vec![0; 2 * MIB]);
+    fatfs::format_volume(&mut volume, fatfs::FormatVolumeOptions::new()).unwrap();
+    {
+        let fs = fatfs::FileSystem::new(&mut volume, fatfs::FsOptions::new()).unwrap();
+        let boot = fs
+            .root_dir()
+            .create_dir("EFI")
+            .unwrap()
+            .create_dir("BOOT")
+            .unwrap();
+        boot.create_file("hello.txt")
+            .unwrap()
+            .write_all(b"hello fat\n")
+            .unwrap();
+    }
+    volume.into_inner()
+}
+
+/// A GPT disk: 1 EFI (FAT), 2 NTFS, 3 a Linux partition without a filesystem.
+fn disk_image() -> Vec<u8> {
+    let partitions = [
+        (fat_volume(), EFI_TYPE),
+        (ntfs_volume(), BASIC_DATA_TYPE),
+        (vec![0; MIB], LINUX_TYPE),
+    ];
+    let size = 2 * MIB + partitions.iter().map(|p| p.0.len()).sum::<usize>();
+    let mut disk = Cursor::new(vec![0; size]);
+    let mut gpt = gptman::GPT::new_from(&mut disk, 512, [7; 16]).unwrap();
+    let mut lba = 2048;
+    for (number, (data, kind)) in (1..).zip(&partitions) {
+        let sectors = data.len() as u64 / 512;
+        gpt[number] = gptman::GPTPartitionEntry {
+            partition_type_guid: *kind,
+            unique_partition_guid: [number as u8; 16],
+            starting_lba: lba,
+            ending_lba: lba + sectors - 1,
+            attribute_bits: 0,
+            partition_name: "".into(),
+        };
+        disk.get_mut()[lba as usize * 512..][..data.len()].copy_from_slice(data);
+        lba += sectors;
+    }
+    gpt.write_into(&mut disk).unwrap();
+    disk.into_inner()
+}
+
+fn image_fixture() -> Fixture {
+    let disk = disk_image();
+    Fixture::with_source(|source| fs::write(source.join("disk.img"), disk).unwrap())
+}
+
+fn names(entries: &[restic_gtk::backend::Entry]) -> Vec<&str> {
+    entries.iter().map(|e| e.name.as_str()).collect()
+}
+
+#[test]
+fn lists_the_partitions_of_a_disk_image() {
+    let fixture = image_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    let data = session.list_dir(&snapshot, Path::new("/data")).unwrap();
+    assert_eq!(data[0].kind, EntryKind::DiskImage);
+    assert!(!data[0].inside_image);
+
+    let partitions = session.list_dir(&snapshot, Path::new(IMAGE)).unwrap();
+    assert_eq!(
+        names(&partitions),
+        ["Partition 1 (EFI)", "Partition 2", "Partition 3"]
+    );
+    assert_eq!(partitions[0].kind, EntryKind::Partition);
+    assert_eq!(partitions[1].kind, EntryKind::Partition);
+    assert!(matches!(partitions[2].kind, EntryKind::Unavailable { .. }));
+    assert_eq!(partitions[1].size, 4 * MIB as u64);
+    assert!(partitions.iter().all(|p| p.inside_image));
+    assert_eq!(partitions[1].path, Path::new(IMAGE).join("Partition 2"));
+}
+
+#[test]
+fn browses_and_opens_files_on_ntfs() {
+    let fixture = image_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let volume = Path::new(IMAGE).join("Partition 2");
+
+    let root = session.list_dir(&snapshot, &volume).unwrap();
+    assert_eq!(names(&root), ["docs", "empty", "big.bin", "link"]);
+    assert!(root.iter().all(|e| e.inside_image && e.mtime.is_some()));
+    assert_eq!(root[2].size, 300_000);
+    assert_eq!(
+        root[3].kind,
+        EntryKind::Symlink {
+            target: "docs".into()
+        }
+    );
+
+    let docs = session.list_dir(&snapshot, &volume.join("docs")).unwrap();
+    assert_eq!(names(&docs), ["sub", "größe.txt", "readme.txt"]);
+    // Lookups ignore case, like Windows.
+    let sub = session
+        .list_dir(&snapshot, &volume.join("DOCS/Sub"))
+        .unwrap();
+    assert_eq!(names(&sub), ["deep.txt"]);
+
+    let dir = fixture.dir.path().join("runtime");
+    let extract = |path: &str| {
+        let file = session
+            .extract_file(&snapshot, &volume.join(path), &dir)
+            .unwrap();
+        assert_eq!(mode(&file), 0o400);
+        fs::read(file).unwrap()
+    };
+    assert_eq!(extract("docs/größe.txt"), b"unicode\n");
+    assert_eq!(extract("docs/sub/deep.txt"), b"deep\n");
+    let big = extract("big.bin");
+    assert!(
+        big.iter()
+            .enumerate()
+            .all(|(i, &b)| b == (i * 7 % 251) as u8)
+    );
+    assert_eq!(big.len(), 300_000);
+}
+
+#[test]
+fn browses_and_opens_files_on_fat() {
+    let fixture = image_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let boot = Path::new(IMAGE).join("Partition 1 (EFI)/EFI/BOOT");
+
+    let entries = session.list_dir(&snapshot, &boot).unwrap();
+    assert_eq!(names(&entries), ["hello.txt"]);
+    assert_eq!(entries[0].size, 10);
+
+    let file = session
+        .extract_file(&snapshot, &boot.join("hello.txt"), fixture.dir.path())
+        .unwrap();
+    assert_eq!(fs::read_to_string(file).unwrap(), "hello fat\n");
+}
+
+#[test]
+fn reports_what_a_disk_image_cannot_show() {
+    let fixture = image_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let image = Path::new(IMAGE);
+
+    let result = session.list_dir(&snapshot, &image.join("Partition 3"));
+    assert!(
+        matches!(result, Err(Error::UnsupportedFilesystem(_))),
+        "{result:?}"
+    );
+    let result = session.list_dir(&snapshot, &image.join("Partition 9"));
+    assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+    let result = session.list_dir(&snapshot, &image.join("Partition 2/missing"));
+    assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+    let result = session.list_dir(&snapshot, &image.join("Partition 2/big.bin"));
+    assert!(matches!(result, Err(Error::NotADirectory(_))), "{result:?}");
+    let result = session.extract_file(
+        &snapshot,
+        &image.join("Partition 2/docs"),
+        fixture.dir.path(),
+    );
+    assert!(matches!(result, Err(Error::NotAFile(_))), "{result:?}");
+    let result = session.extract_file(
+        &snapshot,
+        &image.join("Partition 2/link"),
+        fixture.dir.path(),
+    );
+    assert!(
+        matches!(result, Err(Error::UnsupportedFile { .. })),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn restores_a_disk_image_but_nothing_inside() {
+    let fixture = image_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    let inside = RestoreRequest {
+        items: vec![Path::new(IMAGE).join("Partition 2/docs")],
+        target: fixture.folder("inside"),
+    };
+    let result = session.restore(&snapshot, &inside, |_| {});
+    assert!(matches!(result, Err(Error::RestoreFromImage)), "{result:?}");
+
+    let whole = RestoreRequest {
+        items: vec![IMAGE.into()],
+        target: fixture.folder("whole"),
+    };
+    session.restore(&snapshot, &whole, |_| {}).unwrap();
+    assert_eq!(
+        fs::read(whole.target.join("disk.img")).unwrap(),
+        fs::read(fixture.dir.path().join("source/disk.img")).unwrap()
+    );
 }
