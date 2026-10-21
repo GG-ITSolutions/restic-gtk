@@ -29,7 +29,9 @@ no `restic` binary is needed.
   the partitions (GPT or MBR), then the files of NTFS and FAT volumes. Opening a file reads only
   its blocks; files Windows stores compressed (CompactOS/WOF with XPRESS or LZX, NTFS
   compression) are decompressed. Drive letters come from the `system.json` that
-  `backup-windows` writes next to its images. Files inside images can be opened, not restored.
+  `backup-windows` writes next to its images. Files, folders and whole partitions inside images
+  can be restored as well, with their content and modification time; links are left out, and
+  so are files that can't be read (EFS-encrypted, deduplicated, WIMBoot).
 - **Restore** selected files and folders into a folder of your choice, as
   `<folder>/<name>`. Before existing files are replaced, their number is shown and must be
   confirmed, then the restore shows its progress. A folder, file or link of another type in
@@ -79,7 +81,8 @@ New files must be known to git (`git add`), otherwise the flake doesn't see them
 - A running restore can't be cancelled; rustic_core offers no way to abort it.
 - Restoring to non-UTF-8 target paths is not supported.
 - Disk images: ext2/3/4 and LVM, BitLocker and LUKS, qcow2/VHD(X)/VMDK and compressed images
-  (`.img.gz`) can't be browsed yet. Changes still in the NTFS journal of an image of a running
+  (`.img.gz`) can't be browsed yet. Restoring from images keeps no permissions, owners or
+  alternate data streams. Changes still in the NTFS journal of an image of a running
   system are not applied.
 - Fragmented files in disk images are slow to open: every scattered piece fetches a whole blob
   (about 1 MiB) from the repository. Logs with NTFS compression are typical, a 79 MB Windows

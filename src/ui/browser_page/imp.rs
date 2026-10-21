@@ -305,8 +305,10 @@ impl BrowserPage {
                 EntryKind::Dir | EntryKind::File | EntryKind::DiskImage | EntryKind::Partition
             )
         );
-        // Files inside disk images can only be opened.
-        let restorable = !selected.is_empty() && selected.iter().all(|e| !e.entry().inside_image);
+        let restorable = !selected.is_empty()
+            && selected
+                .iter()
+                .all(|e| !matches!(e.entry().kind, EntryKind::Unavailable { .. }));
         let obj = self.obj();
         obj.action_set_enabled("browser.open", openable);
         obj.action_set_enabled("browser.restore", restorable);
@@ -416,8 +418,10 @@ impl BrowserPage {
                 };
 
                 let request = RestoreRequest { items, target };
-                if RestoreDialog::run(&obj, session, snapshot, request.clone()).await {
-                    show_restored_toast(&obj, &request.target);
+                if let Some(summary) =
+                    RestoreDialog::run(&obj, session, snapshot, request.clone()).await
+                {
+                    show_restored_toast(&obj, &request.target, summary.skipped);
                     obj.imp().selection.unselect_all();
                 }
             }
@@ -425,12 +429,20 @@ impl BrowserPage {
     }
 }
 
-fn show_restored_toast(widget: &impl IsA<gtk::Widget>, target: &Path) {
+fn show_restored_toast(widget: &impl IsA<gtk::Widget>, target: &Path, skipped: u64) {
+    let mut title = format!("Restored to “{}”", target.display());
+    if skipped > 0 {
+        title += &format!(
+            ", {} skipped",
+            format::count(
+                skipped,
+                "link or unsupported file",
+                "links or unsupported files"
+            )
+        );
+    }
     let toast = adw::Toast::builder()
-        .title(glib::markup_escape_text(&format!(
-            "Restored to “{}”",
-            target.display()
-        )))
+        .title(glib::markup_escape_text(&title))
         .button_label("Open Folder")
         .build();
     let folder = gio::File::for_path(target);

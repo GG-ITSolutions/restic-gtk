@@ -34,10 +34,6 @@ pub enum Error {
     #[error("{0}")]
     UnsupportedFilesystem(String),
 
-    /// Disk images and the snapshot paths inside them can't be restored, only opened.
-    #[error("Files inside disk images can't be restored, only opened")]
-    RestoreFromImage,
-
     /// A disk image that can't be read, e.g. a damaged filesystem.
     #[error("{0}")]
     Image(String),

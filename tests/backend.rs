@@ -625,7 +625,7 @@ fn restore_refuses_entries_of_another_type_in_target() {
         };
         for result in [
             session.preview_restore(&snapshot, &request).map(|_| ()),
-            session.restore(&snapshot, &request, |_| {}),
+            session.restore(&snapshot, &request, |_| {}).map(|_| ()),
         ] {
             match result {
                 Err(Error::TargetExists { path, existing: e }) => {
@@ -866,17 +866,10 @@ fn reports_what_a_disk_image_cannot_show() {
 }
 
 #[test]
-fn restores_a_disk_image_but_nothing_inside() {
+fn restores_a_disk_image_as_a_file() {
     let fixture = image_fixture();
     let session = fixture.open();
     let snapshot = fixture.snapshot(&session);
-
-    let inside = RestoreRequest {
-        items: vec![Path::new(IMAGE).join("Partition 2/docs")],
-        target: fixture.folder("inside"),
-    };
-    let result = session.restore(&snapshot, &inside, |_| {});
-    assert!(matches!(result, Err(Error::RestoreFromImage)), "{result:?}");
 
     let whole = RestoreRequest {
         items: vec![IMAGE.into()],
@@ -886,5 +879,150 @@ fn restores_a_disk_image_but_nothing_inside() {
     assert_eq!(
         fs::read(whole.target.join("disk.img")).unwrap(),
         fs::read(fixture.dir.path().join("source/disk.img")).unwrap()
+    );
+}
+
+#[test]
+fn restores_folders_from_a_disk_image() {
+    let fixture = image_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let volume = Path::new(IMAGE).join("Partition 2");
+    let target = fixture.folder("target");
+    let request = RestoreRequest {
+        items: vec![volume.join("docs")],
+        target: target.clone(),
+    };
+
+    let preview = session.preview_restore(&snapshot, &request).unwrap();
+    assert_eq!((preview.files, preview.conflicts), (3, 0));
+    assert_eq!(preview.bytes, 11 + 8 + 5);
+    assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+
+    let (updates, sink) = recorder();
+    let summary = session.restore(&snapshot, &request, sink).unwrap();
+    assert_eq!(summary.skipped, 0);
+    let last = updates.lock().unwrap().last().cloned().unwrap();
+    assert!(last.finished && last.position == preview.bytes);
+
+    let docs = target.join("docs");
+    assert_eq!(
+        fs::read_to_string(docs.join("readme.txt")).unwrap(),
+        "hello ntfs\n"
+    );
+    assert_eq!(
+        fs::read_to_string(docs.join("größe.txt")).unwrap(),
+        "unicode\n"
+    );
+    assert_eq!(
+        fs::read_to_string(docs.join("sub/deep.txt")).unwrap(),
+        "deep\n"
+    );
+    let listed = session.list_dir(&snapshot, &volume.join("docs")).unwrap();
+    let readme = listed.iter().find(|e| e.name == "readme.txt").unwrap();
+    assert_eq!(
+        fs::metadata(docs.join("readme.txt"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        std::time::SystemTime::from(readme.mtime.unwrap())
+    );
+    // Nothing half written left behind.
+    assert_eq!(fs::read_dir(&docs).unwrap().count(), 3);
+
+    // Unchanged files are kept, changed ones replaced after asking.
+    let preview = session.preview_restore(&snapshot, &request).unwrap();
+    assert_eq!((preview.files, preview.conflicts), (0, 0));
+    write(&docs.join("readme.txt"), "mine\n");
+    let preview = session.preview_restore(&snapshot, &request).unwrap();
+    assert_eq!((preview.files, preview.conflicts), (1, 1));
+    session.restore(&snapshot, &request, |_| {}).unwrap();
+    assert_eq!(
+        fs::read_to_string(docs.join("readme.txt")).unwrap(),
+        "hello ntfs\n"
+    );
+}
+
+#[test]
+fn restores_files_and_partitions_from_a_disk_image() {
+    let fixture = image_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let target = fixture.folder("target");
+    let request = RestoreRequest {
+        items: vec![
+            Path::new(IMAGE).join("Partition 2/big.bin"),
+            Path::new(IMAGE).join("Partition 1 (EFI)"),
+        ],
+        target: target.clone(),
+    };
+    let summary = session.restore(&snapshot, &request, |_| {}).unwrap();
+    assert_eq!(summary.skipped, 0);
+    let big = fs::read(target.join("big.bin")).unwrap();
+    assert!(
+        big.len() == 300_000
+            && big
+                .iter()
+                .enumerate()
+                .all(|(i, b)| *b == (i * 7 % 251) as u8)
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("Partition 1 (EFI)/EFI/BOOT/hello.txt")).unwrap(),
+        "hello fat\n"
+    );
+
+    // A whole NTFS volume: links are left out.
+    let request = RestoreRequest {
+        items: vec![Path::new(IMAGE).join("Partition 2")],
+        target: target.clone(),
+    };
+    assert_eq!(
+        session
+            .preview_restore(&snapshot, &request)
+            .unwrap()
+            .skipped,
+        1
+    );
+    let summary = session.restore(&snapshot, &request, |_| {}).unwrap();
+    assert_eq!(summary.skipped, 1);
+    let volume = target.join("Partition 2");
+    assert!(volume.join("empty").is_dir());
+    assert!(volume.join("docs/sub/deep.txt").is_file());
+    assert!(fs::symlink_metadata(volume.join("link")).is_err());
+}
+
+#[test]
+fn restore_from_a_disk_image_checks_the_target_first() {
+    let fixture = image_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    let target = fixture.folder("target");
+    write(&target.join("docs/sub"), "mine\n");
+    let request = RestoreRequest {
+        items: vec![Path::new(IMAGE).join("Partition 2/docs")],
+        target: target.clone(),
+    };
+    for result in [
+        session.preview_restore(&snapshot, &request).map(|_| ()),
+        session.restore(&snapshot, &request, |_| {}).map(|_| ()),
+    ] {
+        match result {
+            Err(Error::TargetExists { path, existing }) => {
+                assert_eq!((path, existing), (target.join("docs/sub"), "a file"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(!target.join("docs/readme.txt").exists());
+
+    let unavailable = RestoreRequest {
+        items: vec![Path::new(IMAGE).join("Partition 3")],
+        target: fixture.folder("other"),
+    };
+    let result = session.restore(&snapshot, &unavailable, |_| {});
+    assert!(
+        matches!(result, Err(Error::UnsupportedFilesystem(_))),
+        "{result:?}"
     );
 }

@@ -2,7 +2,9 @@ use std::{cell::RefCell, sync::Arc};
 
 use adw::{prelude::*, subclass::prelude::*};
 use gtk::{CompositeTemplate, glib, glib::clone};
-use restic_gtk::backend::{ProgressKind, ProgressUpdate, RestoreRequest, Session, Snapshot};
+use restic_gtk::backend::{
+    ProgressKind, ProgressUpdate, RestoreRequest, RestoreSummary, Session, Snapshot,
+};
 
 use crate::ui::{format, run_blocking, set_plain_description};
 
@@ -23,7 +25,7 @@ pub struct RestoreDialog {
     error_status: TemplateChild<adw::StatusPage>,
 
     /// Present until the dialog is closed; sending signals success.
-    pub result: RefCell<Option<async_channel::Sender<()>>>,
+    pub result: RefCell<Option<async_channel::Sender<RestoreSummary>>>,
     /// The restore waiting for confirmation.
     pending: RefCell<Option<(Arc<Session>, Snapshot, RestoreRequest)>>,
 }
@@ -133,9 +135,9 @@ impl RestoreDialog {
                 obj.set_can_close(true);
                 let imp = obj.imp();
                 match result {
-                    Ok(()) => {
+                    Ok(summary) => {
                         if let Some(sender) = imp.result.take() {
-                            let _ = sender.try_send(());
+                            let _ = sender.try_send(summary);
                         }
                         obj.close();
                     }

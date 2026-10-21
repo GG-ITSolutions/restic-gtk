@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use adw::{prelude::*, subclass::prelude::*};
 use gtk::glib;
-use restic_gtk::backend::{RestoreRequest, Session, Snapshot};
+use restic_gtk::backend::{RestoreRequest, RestoreSummary, Session, Snapshot};
 
 glib::wrapper! {
     /// Restores entries of a snapshot: checks the target, asks before replacing
@@ -15,20 +15,20 @@ glib::wrapper! {
 }
 
 impl RestoreDialog {
-    /// Shows the dialog; resolves to `true` once everything is restored.
+    /// Shows the dialog; resolves to what was left out once everything is restored.
     pub async fn run(
         parent: &impl IsA<gtk::Widget>,
         session: Arc<Session>,
         snapshot: Snapshot,
         request: RestoreRequest,
-    ) -> bool {
+    ) -> Option<RestoreSummary> {
         let dialog: Self = glib::Object::new();
         let (sender, receiver) = async_channel::bounded(1);
         dialog.imp().result.replace(Some(sender));
         dialog.connect_closed(|dialog| drop(dialog.imp().result.take()));
         dialog.present(Some(parent));
         dialog.imp().start(session, snapshot, request);
-        receiver.recv().await.is_ok()
+        receiver.recv().await.ok()
     }
 
     /// Whether files are being written right now.

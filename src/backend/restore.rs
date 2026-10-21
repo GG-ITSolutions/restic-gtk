@@ -1,19 +1,28 @@
 use std::{
-    fs, io,
+    fs::{self, File},
+    io::{self, Write},
     os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
     sync::Arc,
+    time::SystemTime,
 };
 
 use rustic_core::{
     LocalDestination, LsOptions, RestoreOptions,
+    jiff::Timestamp,
     repofile::{Node, NodeType},
 };
 
 use super::{
-    Error, ProgressKind, ProgressUpdate, Result, Session, Snapshot,
+    Entry, EntryKind, Error, ProgressKind, ProgressUpdate, Result, Session, Snapshot,
     session::{IndexedRepo, Location},
 };
+
+/// Appended to the name of a file from a disk image while it is written.
+const PART_SUFFIX: &str = ".restic-gtk-part";
+
+/// Bytes between two progress reports while writing a file from a disk image.
+const REPORT_EVERY: u64 = 256 * 1024;
 
 /// Entries of one snapshot to restore into a folder.
 ///
@@ -34,12 +43,55 @@ pub struct RestorePreview {
     pub bytes: u64,
     /// Existing files in the target that will be overwritten with different content.
     pub conflicts: u64,
+    /// Links inside disk images, which aren't restored.
+    pub skipped: u64,
 }
 
-/// One requested entry, resolved to its node and its place in the target.
-struct Item {
+/// What a finished restore left out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RestoreSummary {
+    /// Links and files inside disk images that couldn't be restored, e.g. encrypted ones.
+    pub skipped: u64,
+}
+
+/// One requested entry, resolved to what it restores.
+#[allow(clippy::large_enum_variant)] // Short-lived.
+enum Item {
+    /// An entry of the snapshot, restored by rustic to `destination`.
+    Node { node: Node, destination: PathBuf },
+    /// A file or folder inside a disk image.
+    Image(ImagePlan),
+}
+
+/// Everything to write for one entry inside a disk image.
+struct ImagePlan {
+    /// The image file and the `system.json` next to it.
     node: Node,
+    path: PathBuf,
+    system_json: Option<Node>,
+    /// Folders to create, parents first.
+    dirs: Vec<PathBuf>,
+    files: Vec<ImageFile>,
+    /// Links, not restored.
+    skipped: u64,
+}
+
+struct ImageFile {
+    /// The path inside the image.
+    inner: PathBuf,
     destination: PathBuf,
+    size: u64,
+    mtime: Option<Timestamp>,
+    state: FileState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileState {
+    New,
+    /// Exists with another size or time, is replaced.
+    Changed,
+    /// Exists with the same size and time, is kept.
+    Unchanged,
 }
 
 impl Session {
@@ -52,16 +104,27 @@ impl Session {
         let options = RestoreOptions::default();
         let mut preview = RestorePreview::default();
         for item in self.resolve(&repo, snapshot, request)? {
-            let destination = item.local_destination(false)?;
-            let plan = repo.prepare_restore(
-                &options,
-                repo.ls(&item.node, &LsOptions::default())?,
-                &destination,
-                true,
-            )?;
-            preview.files += plan.stats.files.restore;
-            preview.bytes += plan.restore_size;
-            preview.conflicts += plan.stats.files.modify;
+            match item {
+                Item::Node { node, destination } => {
+                    let plan = repo.prepare_restore(
+                        &options,
+                        repo.ls(&node, &LsOptions::default())?,
+                        &local_destination(&destination, &node, false)?,
+                        true,
+                    )?;
+                    preview.files += plan.stats.files.restore;
+                    preview.bytes += plan.restore_size;
+                    preview.conflicts += plan.stats.files.modify;
+                }
+                Item::Image(plan) => {
+                    for file in plan.files_to_write() {
+                        preview.files += 1;
+                        preview.bytes += file.size;
+                        preview.conflicts += u64::from(file.state == FileState::Changed);
+                    }
+                    preview.skipped += plan.skipped;
+                }
+            }
         }
         Ok(preview)
     }
@@ -75,7 +138,7 @@ impl Session {
         snapshot: &Snapshot,
         request: &RestoreRequest,
         on_progress: impl Fn(ProgressUpdate) + Send + Sync + 'static,
-    ) -> Result<()> {
+    ) -> Result<RestoreSummary> {
         let on_progress = Arc::new(on_progress);
         on_progress(ProgressUpdate {
             kind: ProgressKind::Activity,
@@ -91,57 +154,137 @@ impl Session {
         // Prepare everything first: creates the folders and yields the total size.
         let mut prepared = Vec::new();
         for item in self.resolve(&repo, snapshot, request)? {
-            let destination = item.local_destination(true)?;
-            let plan = repo.prepare_restore(
-                &options,
-                repo.ls(&item.node, &LsOptions::default())?,
-                &destination,
-                false,
-            )?;
-            prepared.push((item, destination, plan));
-        }
-        let total: u64 = prepared.iter().map(|(_, _, plan)| plan.restore_size).sum();
-
-        let mut done = 0;
-        for (item, destination, plan) in prepared {
-            let size = plan.restore_size;
-            let on_progress = on_progress.clone();
-            let report = move |update: ProgressUpdate| {
-                if update.kind == ProgressKind::Bytes {
-                    on_progress(ProgressUpdate {
-                        kind: ProgressKind::Bytes,
-                        title: String::new(),
-                        position: done + update.position.min(size),
-                        length: total,
-                        finished: false,
-                    });
+            prepared.push(match item {
+                Item::Node { node, destination } => {
+                    let destination = local_destination(&destination, &node, true)?;
+                    let plan = repo.prepare_restore(
+                        &options,
+                        repo.ls(&node, &LsOptions::default())?,
+                        &destination,
+                        false,
+                    )?;
+                    let size = plan.restore_size;
+                    (Prepared::Node(node, destination, plan), size)
                 }
+                Item::Image(plan) => {
+                    let size = plan.files_to_write().map(|f| f.size).sum();
+                    (Prepared::Image(plan), size)
+                }
+            });
+        }
+        let total: u64 = prepared.iter().map(|(_, size)| size).sum();
+        let bytes = move |position: u64| {
+            on_progress(ProgressUpdate {
+                kind: ProgressKind::Bytes,
+                title: String::new(),
+                position,
+                length: total,
+                finished: position == total,
+            })
+        };
+        let bytes = Arc::new(bytes);
+
+        let mut summary = RestoreSummary::default();
+        let mut done = 0;
+        for (prepared, size) in prepared {
+            let report = {
+                let bytes = bytes.clone();
+                move |position: u64| bytes(done + position.min(size))
             };
-            self.with_progress(Arc::new(report), || {
-                repo.restore(
-                    plan,
-                    &options,
-                    repo.ls(&item.node, &LsOptions::default())?,
-                    &destination,
-                )
-            })?;
+            match prepared {
+                Prepared::Node(node, destination, plan) => {
+                    let report = move |update: ProgressUpdate| {
+                        if update.kind == ProgressKind::Bytes {
+                            report(update.position);
+                        }
+                    };
+                    self.with_progress(Arc::new(report), || {
+                        repo.restore(
+                            plan,
+                            &options,
+                            repo.ls(&node, &LsOptions::default())?,
+                            &destination,
+                        )
+                    })?;
+                }
+                Prepared::Image(plan) => {
+                    summary.skipped += self.restore_image(&repo, snapshot, &plan, report)?;
+                }
+            }
             done += size;
         }
 
-        on_progress(ProgressUpdate {
-            kind: ProgressKind::Bytes,
-            title: String::new(),
-            position: total,
-            length: total,
-            finished: true,
-        });
-        Ok(())
+        bytes(total);
+        Ok(summary)
     }
 
-    /// Finds the requested nodes and checks their places in the target, before anything is written.
+    /// Writes the files of `plan`; returns how many were skipped.
+    fn restore_image(
+        &self,
+        repo: &Arc<IndexedRepo>,
+        snapshot: &Snapshot,
+        plan: &ImagePlan,
+        report: impl Fn(u64),
+    ) -> Result<u64> {
+        for dir in &plan.dirs {
+            fs::create_dir_all(dir)?;
+        }
+        let image = self.image_ref(
+            repo,
+            snapshot,
+            &plan.node,
+            &plan.path,
+            plan.system_json.clone(),
+        );
+        let mut skipped = plan.skipped;
+        let mut done = 0;
+        for file in plan.files_to_write() {
+            let mut name = file.destination.clone().into_os_string();
+            name.push(PART_SUFFIX);
+            let part = PathBuf::from(name);
+            let written = (|| {
+                // Never through a link someone left at this name.
+                match fs::remove_file(&part) {
+                    Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
+                    _ => {}
+                }
+                let out = File::options().write(true).create_new(true).open(&part)?;
+                let mut counting = CountingWriter {
+                    out: io::BufWriter::new(out),
+                    written: 0,
+                    reported: 0,
+                    report: |written: u64| report(done + written.min(file.size)),
+                };
+                self.images.write_file(&image, &file.inner, &mut counting)?;
+                let out = counting.out.into_inner().map_err(|err| err.into_error())?;
+                if let Some(mtime) = file.mtime {
+                    out.set_modified(SystemTime::from(mtime))?;
+                }
+                drop(out);
+                fs::rename(&part, &file.destination)?;
+                Ok(())
+            })();
+            match written {
+                Ok(()) => {}
+                Err(err) => {
+                    let _ = fs::remove_file(&part);
+                    match err {
+                        // Encrypted, deduplicated or stored elsewhere: leave it out.
+                        Error::UnsupportedFile { .. } => skipped += 1,
+                        err => return Err(err),
+                    }
+                }
+            }
+            done += file.size;
+            report(done);
+        }
+        Ok(skipped)
+    }
+
+    /// Finds the requested entries and checks their places in the target, before anything is written.
     fn resolve(
         &self,
-        repo: &IndexedRepo,
+        repo: &Arc<IndexedRepo>,
         snapshot: &Snapshot,
         request: &RestoreRequest,
     ) -> Result<Vec<Item>> {
@@ -149,13 +292,35 @@ impl Session {
             .items
             .iter()
             .map(|path| {
-                // A disk image file restores as a file, but nothing inside it.
                 let node = match self.locate(repo, snapshot, path)? {
                     Location::Node(node) => node,
+                    // A disk image file restores as a file.
                     Location::Image { node, inner, .. } if inner.components().next().is_none() => {
                         node
                     }
-                    Location::Image { .. } => return Err(Error::RestoreFromImage),
+                    Location::Image {
+                        node,
+                        path: image_path,
+                        inner,
+                        system_json,
+                    } => {
+                        return self
+                            .plan_image(
+                                repo,
+                                snapshot,
+                                ImagePlan {
+                                    node,
+                                    path: image_path,
+                                    system_json,
+                                    dirs: Vec::new(),
+                                    files: Vec::new(),
+                                    skipped: 0,
+                                },
+                                &inner,
+                                &request.target,
+                            )
+                            .map(Item::Image);
+                    }
                 };
                 let destination = request.target.join(node.name());
                 check_target(&destination, &node)?;
@@ -165,9 +330,133 @@ impl Session {
                         check_target(&destination.join(path), &node)?;
                     }
                 }
-                Ok(Item { node, destination })
+                Ok(Item::Node { node, destination })
             })
             .collect()
+    }
+
+    /// Fills `plan` with everything below `inner` in the image, checking the target on the way.
+    fn plan_image(
+        &self,
+        repo: &Arc<IndexedRepo>,
+        snapshot: &Snapshot,
+        mut plan: ImagePlan,
+        inner: &Path,
+        target: &Path,
+    ) -> Result<ImagePlan> {
+        let image = self.image_ref(
+            repo,
+            snapshot,
+            &plan.node,
+            &plan.path,
+            plan.system_json.clone(),
+        );
+        let shown = plan.path.join(inner);
+        // The parent's listing has the size and time of the entry.
+        let entry = self
+            .images
+            .list(&image, inner.parent().unwrap_or(Path::new("")))?
+            .into_iter()
+            .find(|e| e.path.file_name() == inner.file_name())
+            .ok_or_else(|| Error::NotFound(shown.clone()))?;
+        if let EntryKind::Unavailable { reason } = entry.kind {
+            return Err(Error::UnsupportedFilesystem(reason));
+        }
+        let destination = target.join(entry.path.file_name().ok_or(Error::NotFound(shown))?);
+
+        let mut pending = vec![(entry, destination)];
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        let mut skipped = 0;
+        while let Some((entry, destination)) = pending.pop() {
+            let inner = entry
+                .path
+                .strip_prefix(&plan.path)
+                .expect("entries of an image are below it")
+                .to_path_buf();
+            match entry.kind {
+                EntryKind::Dir | EntryKind::Partition => {
+                    check_existing(&destination, |kind| Ok(kind.is_dir()))?;
+                    for child in self.images.list(&image, &inner)? {
+                        let name = child.path.file_name().unwrap_or_default().to_owned();
+                        pending.push((child, destination.join(name)));
+                    }
+                    dirs.push(destination);
+                }
+                EntryKind::File | EntryKind::DiskImage => {
+                    let existing = check_existing(&destination, |kind| Ok(kind.is_file()))?;
+                    files.push(ImageFile {
+                        state: file_state(existing.as_ref(), &entry),
+                        inner,
+                        destination,
+                        size: entry.size,
+                        mtime: entry.mtime,
+                    });
+                }
+                // Links point to Windows paths, which mean nothing here.
+                EntryKind::Symlink { .. } | EntryKind::Special | EntryKind::Unavailable { .. } => {
+                    skipped += 1
+                }
+            }
+        }
+        plan.dirs = dirs;
+        plan.files = files;
+        plan.skipped = skipped;
+        Ok(plan)
+    }
+}
+
+impl ImagePlan {
+    fn files_to_write(&self) -> impl Iterator<Item = &ImageFile> {
+        self.files
+            .iter()
+            .filter(|f| f.state != FileState::Unchanged)
+    }
+}
+
+/// How a file from an image relates to what is at its place in the target.
+fn file_state(existing: Option<&fs::Metadata>, entry: &Entry) -> FileState {
+    let Some(existing) = existing else {
+        return FileState::New;
+    };
+    let same_time = entry
+        .mtime
+        .is_some_and(|mtime| existing.modified().ok() == Some(SystemTime::from(mtime)));
+    if same_time && existing.len() == entry.size {
+        FileState::Unchanged
+    } else {
+        FileState::Changed
+    }
+}
+
+/// A restore prepared to run.
+#[allow(clippy::large_enum_variant)] // Short-lived.
+enum Prepared {
+    Node(Node, LocalDestination, rustic_core::RestorePlan),
+    Image(ImagePlan),
+}
+
+/// Counts what goes through and reports it every [`REPORT_EVERY`] bytes.
+struct CountingWriter<W, F> {
+    out: W,
+    written: u64,
+    reported: u64,
+    report: F,
+}
+
+impl<W: Write, F: Fn(u64)> Write for CountingWriter<W, F> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.out.write(buf)?;
+        self.written += n as u64;
+        if self.written - self.reported >= REPORT_EVERY {
+            self.reported = self.written;
+            (self.report)(self.written);
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.flush()
     }
 }
 
@@ -177,24 +466,34 @@ impl Session {
 /// the snapshot as well, and follows symlinks it finds: it then writes outside of the target,
 /// skips the entry silently or panics.
 fn check_target(path: &Path, node: &Node) -> Result<()> {
+    check_existing(path, |kind| {
+        Ok(match &node.node_type {
+            NodeType::Dir => kind.is_dir(),
+            NodeType::File => kind.is_file(),
+            NodeType::Symlink { .. } => {
+                kind.is_symlink() && fs::read_link(path)? == node.node_type.to_link()
+            }
+            NodeType::Dev { .. } => kind.is_block_device(),
+            NodeType::Chardev { .. } => kind.is_char_device(),
+            NodeType::Fifo => kind.is_fifo(),
+            NodeType::Socket => kind.is_socket(),
+        })
+    })
+    .map(|_| ())
+}
+
+/// Fails if `path` holds something that doesn't `fit`; returns what is there, if anything.
+fn check_existing(
+    path: &Path,
+    fits: impl FnOnce(&fs::FileType) -> io::Result<bool>,
+) -> Result<Option<fs::Metadata>> {
     let meta = match fs::symlink_metadata(path) {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         meta => meta?,
     };
     let kind = meta.file_type();
-    let fits = match &node.node_type {
-        NodeType::Dir => kind.is_dir(),
-        NodeType::File => kind.is_file(),
-        NodeType::Symlink { .. } => {
-            kind.is_symlink() && fs::read_link(path)? == node.node_type.to_link()
-        }
-        NodeType::Dev { .. } => kind.is_block_device(),
-        NodeType::Chardev { .. } => kind.is_char_device(),
-        NodeType::Fifo => kind.is_fifo(),
-        NodeType::Socket => kind.is_socket(),
-    };
-    if fits {
-        return Ok(());
+    if fits(&kind)? {
+        return Ok(Some(meta));
     }
     let existing = if kind.is_symlink() {
         "a link"
@@ -211,14 +510,12 @@ fn check_target(path: &Path, node: &Node) -> Result<()> {
     })
 }
 
-impl Item {
-    fn local_destination(&self, create: bool) -> Result<LocalDestination> {
-        Ok(LocalDestination::new(
-            path_str(&self.destination)?,
-            create,
-            !self.node.is_dir(),
-        )?)
-    }
+fn local_destination(path: &Path, node: &Node, create: bool) -> Result<LocalDestination> {
+    Ok(LocalDestination::new(
+        path_str(path)?,
+        create,
+        !node.is_dir(),
+    )?)
 }
 
 /// rustic takes destinations as `&str`.

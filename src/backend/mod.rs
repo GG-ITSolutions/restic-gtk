@@ -20,7 +20,7 @@ pub use rustic_core::{jiff, repofile::SnapshotSummary};
 pub use error::{Error, Result};
 pub use image::is_disk_image;
 pub use progress::{ProgressKind, ProgressUpdate};
-pub use restore::{RestorePreview, RestoreRequest};
+pub use restore::{RestorePreview, RestoreRequest, RestoreSummary};
 pub use s3::{LOCATION as S3_LOCATION, S3Location};
 pub use session::Session;
 pub use snapshot::Snapshot;

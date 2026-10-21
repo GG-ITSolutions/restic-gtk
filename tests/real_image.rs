@@ -16,7 +16,7 @@ use std::{
     time::Instant,
 };
 
-use restic_gtk::backend::{Entry, EntryKind, RepoConfig, Session, Snapshot};
+use restic_gtk::backend::{Entry, EntryKind, RepoConfig, RestoreRequest, Session, Snapshot};
 
 const IMAGE: &str = "/disk0.img";
 const WINDOWS: &str = "/disk0.img/Partition 3 (C:)";
@@ -170,4 +170,29 @@ fn reads_wof_compressed_files() {
         // Chromium .pak files start with their format version, 5.
         assert_eq!(&data[..4], &[5, 0, 0, 0], "{}", file.path.display());
     }
+}
+
+#[test]
+#[ignore = "needs a real repository, see the module docs"]
+fn restores_a_folder_from_a_windows_image() {
+    let Some((session, snapshot, dir)) = open() else {
+        return;
+    };
+    let request = RestoreRequest {
+        items: vec![Path::new(WINDOWS).join("Windows/System32/drivers/etc")],
+        target: dir.path().join("target"),
+    };
+    fs::create_dir(&request.target).unwrap();
+    let started = Instant::now();
+    let preview = session.preview_restore(&snapshot, &request).unwrap();
+    let summary = session.restore(&snapshot, &request, |_| {}).unwrap();
+    eprintln!(
+        "etc: {} files, {} bytes, {} skipped in {:.2} s",
+        preview.files,
+        preview.bytes,
+        summary.skipped,
+        started.elapsed().as_secs_f64()
+    );
+    let hosts = fs::read_to_string(request.target.join("etc/hosts")).unwrap();
+    assert!(hosts.contains("localhost"));
 }
