@@ -15,6 +15,7 @@ use rustic_core::{
 
 use super::{
     Entry, EntryKind, Error, ProgressKind, ProgressUpdate, Result, Session, Snapshot,
+    archive::ZipRef,
     session::{IndexedRepo, Location},
 };
 
@@ -59,16 +60,82 @@ pub struct RestoreSummary {
 enum Item {
     /// An entry of the snapshot, restored by rustic to `destination`.
     Node { node: Node, destination: PathBuf },
-    /// A file or folder inside a disk image.
+    /// A file or folder inside a disk image or ZIP archive.
     Image(ImagePlan),
 }
 
-/// Everything to write for one entry inside a disk image.
+/// A file in the snapshot that contains the entries to restore.
+#[allow(clippy::large_enum_variant)] // Short-lived.
+enum Source {
+    /// A disk image and the `system.json` next to it.
+    Image {
+        node: Node,
+        path: PathBuf,
+        system_json: Option<Node>,
+    },
+    /// A ZIP archive.
+    Archive { node: Node, path: PathBuf },
+}
+
+impl Source {
+    /// The path of the image or archive file.
+    fn path(&self) -> &Path {
+        match self {
+            Self::Image { path, .. } | Self::Archive { path, .. } => path,
+        }
+    }
+
+    fn list(
+        &self,
+        session: &Session,
+        repo: &Arc<IndexedRepo>,
+        snapshot: &Snapshot,
+        inner: &Path,
+    ) -> Result<Vec<Entry>> {
+        match self {
+            Self::Image {
+                node,
+                path,
+                system_json,
+            } => {
+                let image = session.image_ref(repo, snapshot, node, path, system_json.clone());
+                session.images.list(&image, inner)
+            }
+            Self::Archive { node, path } => {
+                let zip = ZipRef::new(repo, snapshot, node, path);
+                session.zips.list(&zip, inner)
+            }
+        }
+    }
+
+    fn write_file(
+        &self,
+        session: &Session,
+        repo: &Arc<IndexedRepo>,
+        snapshot: &Snapshot,
+        inner: &Path,
+        out: &mut dyn Write,
+    ) -> Result<()> {
+        match self {
+            Self::Image {
+                node,
+                path,
+                system_json,
+            } => {
+                let image = session.image_ref(repo, snapshot, node, path, system_json.clone());
+                session.images.write_file(&image, inner, out)
+            }
+            Self::Archive { node, path } => {
+                let zip = ZipRef::new(repo, snapshot, node, path);
+                session.zips.write_file(&zip, inner, out)
+            }
+        }
+    }
+}
+
+/// Everything to write for one entry inside a disk image or ZIP archive.
 struct ImagePlan {
-    /// The image file and the `system.json` next to it.
-    node: Node,
-    path: PathBuf,
-    system_json: Option<Node>,
+    source: Source,
     /// Folders to create, parents first.
     dirs: Vec<PathBuf>,
     files: Vec<ImageFile>,
@@ -77,7 +144,7 @@ struct ImagePlan {
 }
 
 struct ImageFile {
-    /// The path inside the image.
+    /// The path inside the image or archive.
     inner: PathBuf,
     destination: PathBuf,
     size: u64,
@@ -229,13 +296,6 @@ impl Session {
         for dir in &plan.dirs {
             fs::create_dir_all(dir)?;
         }
-        let image = self.image_ref(
-            repo,
-            snapshot,
-            &plan.node,
-            &plan.path,
-            plan.system_json.clone(),
-        );
         let mut skipped = plan.skipped;
         let mut done = 0;
         for file in plan.files_to_write() {
@@ -255,7 +315,8 @@ impl Session {
                     reported: 0,
                     report: |written: u64| report(done + written.min(file.size)),
                 };
-                self.images.write_file(&image, &file.inner, &mut counting)?;
+                plan.source
+                    .write_file(self, repo, snapshot, &file.inner, &mut counting)?;
                 let out = counting.out.into_inner().map_err(|err| err.into_error())?;
                 if let Some(mtime) = file.mtime {
                     out.set_modified(SystemTime::from(mtime))?;
@@ -304,21 +365,32 @@ impl Session {
                         inner,
                         system_json,
                     } => {
+                        let source = Source::Image {
+                            node,
+                            path: image_path,
+                            system_json,
+                        };
                         return self
-                            .plan_image(
-                                repo,
-                                snapshot,
-                                ImagePlan {
-                                    node,
-                                    path: image_path,
-                                    system_json,
-                                    dirs: Vec::new(),
-                                    files: Vec::new(),
-                                    skipped: 0,
-                                },
-                                &inner,
-                                &request.target,
-                            )
+                            .plan_image(repo, snapshot, source, &inner, &request.target)
+                            .map(Item::Image);
+                    }
+                    // A ZIP file restores as a file, too.
+                    Location::Archive { node, inner, .. }
+                        if inner.components().next().is_none() =>
+                    {
+                        node
+                    }
+                    Location::Archive {
+                        node,
+                        path: zip_path,
+                        inner,
+                    } => {
+                        let source = Source::Archive {
+                            node,
+                            path: zip_path,
+                        };
+                        return self
+                            .plan_image(repo, snapshot, source, &inner, &request.target)
                             .map(Item::Image);
                     }
                 };
@@ -335,27 +407,24 @@ impl Session {
             .collect()
     }
 
-    /// Fills `plan` with everything below `inner` in the image, checking the target on the way.
+    /// Lists everything below `inner` in the image or archive, checking the target on the way.
     fn plan_image(
         &self,
         repo: &Arc<IndexedRepo>,
         snapshot: &Snapshot,
-        mut plan: ImagePlan,
+        source: Source,
         inner: &Path,
         target: &Path,
     ) -> Result<ImagePlan> {
-        let image = self.image_ref(
-            repo,
-            snapshot,
-            &plan.node,
-            &plan.path,
-            plan.system_json.clone(),
-        );
-        let shown = plan.path.join(inner);
+        let shown = source.path().join(inner);
         // The parent's listing has the size and time of the entry.
-        let entry = self
-            .images
-            .list(&image, inner.parent().unwrap_or(Path::new("")))?
+        let entry = source
+            .list(
+                self,
+                repo,
+                snapshot,
+                inner.parent().unwrap_or(Path::new("")),
+            )?
             .into_iter()
             .find(|e| e.path.file_name() == inner.file_name())
             .ok_or_else(|| Error::NotFound(shown.clone()))?;
@@ -371,19 +440,19 @@ impl Session {
         while let Some((entry, destination)) = pending.pop() {
             let inner = entry
                 .path
-                .strip_prefix(&plan.path)
-                .expect("entries of an image are below it")
+                .strip_prefix(source.path())
+                .expect("entries of an image or archive are below it")
                 .to_path_buf();
             match entry.kind {
                 EntryKind::Dir | EntryKind::Partition => {
                     check_existing(&destination, |kind| Ok(kind.is_dir()))?;
-                    for child in self.images.list(&image, &inner)? {
+                    for child in source.list(self, repo, snapshot, &inner)? {
                         let name = child.path.file_name().unwrap_or_default().to_owned();
                         pending.push((child, destination.join(name)));
                     }
                     dirs.push(destination);
                 }
-                EntryKind::File | EntryKind::DiskImage => {
+                EntryKind::File | EntryKind::DiskImage | EntryKind::ZipArchive => {
                     let existing = check_existing(&destination, |kind| Ok(kind.is_file()))?;
                     files.push(ImageFile {
                         state: file_state(existing.as_ref(), &entry),
@@ -399,10 +468,12 @@ impl Session {
                 }
             }
         }
-        plan.dirs = dirs;
-        plan.files = files;
-        plan.skipped = skipped;
-        Ok(plan)
+        Ok(ImagePlan {
+            source,
+            dirs,
+            files,
+            skipped,
+        })
     }
 }
 

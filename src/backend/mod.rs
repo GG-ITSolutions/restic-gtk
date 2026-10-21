@@ -3,6 +3,7 @@
 //! Everything in here is blocking and free of GTK, so the UI runs it on worker
 //! threads and the logic can be tested headless against real repositories.
 
+mod archive;
 mod error;
 mod extract;
 mod image;
@@ -17,6 +18,7 @@ mod tree;
 
 pub use rustic_core::{jiff, repofile::SnapshotSummary};
 
+pub use archive::is_zip_archive;
 pub use error::{Error, Result};
 pub use image::is_disk_image;
 pub use progress::{ProgressKind, ProgressUpdate};

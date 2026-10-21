@@ -13,6 +13,7 @@ mod reader;
 mod system_json;
 mod wof;
 
+pub(crate) use reader::SnapshotReader;
 pub(crate) use system_json::FILE_NAME as SYSTEM_JSON;
 
 use std::{
@@ -28,7 +29,7 @@ use self::{
     fat::FatVolume,
     ntfs::NtfsVolume,
     partition::{FsKind, Partition},
-    reader::{Slice, SnapshotReader},
+    reader::Slice,
 };
 use super::{Entry, EntryKind, Error, Result, session::IndexedRepo};
 

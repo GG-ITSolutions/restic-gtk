@@ -5,7 +5,7 @@ use rustic_core::{
     repofile::{Node, NodeType},
 };
 
-use super::image;
+use super::{archive, image};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryKind {
@@ -18,6 +18,8 @@ pub enum EntryKind {
     Special,
     /// A raw disk image, browsed like a folder of its partitions.
     DiskImage,
+    /// A ZIP archive, browsed like a folder of its entries.
+    ZipArchive,
     /// A partition of a disk image, browsed like a folder.
     Partition,
     /// A partition of a disk image that can't be browsed, e.g. an encrypted one.
@@ -35,7 +37,7 @@ pub struct Entry {
     pub kind: EntryKind,
     pub size: u64,
     pub mtime: Option<Timestamp>,
-    /// Inside a disk image: can be opened, but not restored.
+    /// Inside a disk image or ZIP archive.
     pub inside_image: bool,
 }
 
@@ -49,6 +51,9 @@ impl Entry {
         let kind = match &node.node_type {
             NodeType::Dir => EntryKind::Dir,
             NodeType::File if image::is_image_name(node.name().as_ref()) => EntryKind::DiskImage,
+            NodeType::File if archive::is_zip_file(node.name().as_ref(), node.meta.size) => {
+                EntryKind::ZipArchive
+            }
             NodeType::File => EntryKind::File,
             symlink @ NodeType::Symlink { .. } => EntryKind::Symlink {
                 target: symlink.to_link().to_path_buf(),

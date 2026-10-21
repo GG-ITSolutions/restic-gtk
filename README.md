@@ -32,6 +32,9 @@ no `restic` binary is needed.
   `backup-windows` writes next to its images. Files, folders and whole partitions inside images
   can be restored as well, with their content and modification time; links are left out, and
   so are files that can't be read (EFS-encrypted, deduplicated, WIMBoot).
+- **ZIP archives** (`.zip`) open like folders, without downloading them: only the list of
+  entries and the entries you open are read. Files and folders inside can be restored with
+  their modification time. A `.zip` file that is not a ZIP archive opens like any other file.
 - **Restore** selected files and folders into a folder of your choice, as
   `<folder>/<name>`. Before existing files are replaced, their number is shown and must be
   confirmed, then the restore shows its progress. A folder, file or link of another type in
@@ -84,6 +87,13 @@ New files must be known to git (`git add`), otherwise the flake doesn't see them
   (`.img.gz`) can't be browsed yet. Restoring from images keeps no permissions, owners or
   alternate data streams. Changes still in the NTFS journal of an image of a running
   system are not applied.
+- ZIP archives: only `.zip` opens as a folder, not `.docx`, `.jar` and the like. Encrypted
+  entries and entries compressed with Zstandard or PPMd are listed but can't be opened or
+  restored, there is no password prompt yet. Links are listed and not restored, multi-part
+  archives (`.z01`) are not supported, and archives with more than 500,000 entries are
+  opened as a plain file. Names in code pages other than UTF-8 and CP437 may look garbled,
+  times (stored without a time zone) are taken as local time of this computer. A ZIP inside a
+  ZIP or disk image is extracted completely before it opens.
 - Fragmented files in disk images are slow to open: every scattered piece fetches a whole blob
   (about 1 MiB) from the repository. Logs with NTFS compression are typical, a 79 MB Windows
   CBS log took about 90 s from a rest-server over the internet.
