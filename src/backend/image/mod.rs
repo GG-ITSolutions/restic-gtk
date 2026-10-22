@@ -5,6 +5,7 @@
 //! partitions, below that the files of the filesystem.
 
 mod container;
+mod crypt;
 mod ext;
 mod fat;
 mod lvm;
@@ -17,8 +18,9 @@ mod system_json;
 mod wof;
 
 use std::{
+    collections::HashMap,
     ffi::OsStr,
-    io::Write,
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -27,6 +29,7 @@ use rustic_core::repofile::Node;
 
 use self::{
     container::Disk,
+    crypt::{Decrypted, Secret, VolumeId},
     ext::ExtVolume,
     fat::FatVolume,
     lvm::LvmVolume,
@@ -65,7 +68,13 @@ pub fn is_image_name(name: &OsStr) -> bool {
 pub(crate) struct ImageCache {
     /// Most recently used last.
     images: Mutex<Vec<Arc<OpenImage>>>,
+    /// What unlocked the encrypted volumes, kept until the session ends. Not tied to the open
+    /// images, so a volume that shows up again (another snapshot, an evicted image) opens
+    /// without asking again.
+    keys: KeyCache,
 }
+
+type KeyCache = Mutex<HashMap<VolumeId, Secret>>;
 
 impl std::fmt::Debug for ImageCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -105,6 +114,8 @@ struct OpenPartition {
     drive: Option<char>,
     /// Opened on first use; errors aren't kept, they may be passing network trouble.
     volume: Mutex<Option<Arc<Volume>>>,
+    /// Encrypted partitions: what they decrypt to, once unlocked.
+    unlocked: Mutex<Option<Decrypted>>,
 }
 
 enum Volume {
@@ -112,6 +123,30 @@ enum Volume {
     Fat,
     Ext,
     Lvm(LvmVolume),
+}
+
+/// The bytes of a filesystem: a partition of the image, or what an encrypted one decrypts to.
+enum Source {
+    Raw(Slice<ImageReader>),
+    Decrypted(Decrypted),
+}
+
+impl Read for Source {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Raw(slice) => slice.read(buf),
+            Self::Decrypted(plain) => plain.read(buf),
+        }
+    }
+}
+
+impl Seek for Source {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::Raw(slice) => slice.seek(pos),
+            Self::Decrypted(plain) => plain.seek(pos),
+        }
+    }
 }
 
 impl OpenPartition {
@@ -129,16 +164,35 @@ impl OpenPartition {
         }
     }
 
-    fn slice(&self, image: &ImageReader) -> Slice<ImageReader> {
+    /// The partition as it is on disk.
+    fn raw(&self, image: &ImageReader) -> Slice<ImageReader> {
         Slice::new(image.clone(), self.info.start, self.info.len)
     }
 
-    fn volume(&self, image: &ImageReader) -> Result<Arc<Volume>> {
+    /// The bytes of the filesystem: the partition, or for an unlocked encrypted one its plaintext.
+    fn slice(&self, image: &ImageReader) -> Source {
+        match &*self.unlocked.lock().unwrap() {
+            Some(plain) => Source::Decrypted(plain.rewound()),
+            None => Source::Raw(self.raw(image)),
+        }
+    }
+
+    /// The filesystem of the partition; `None` if it is encrypted and no key for it is known.
+    fn volume(&self, image: &ImageReader, keys: &KeyCache) -> Result<Option<Arc<Volume>>> {
         let mut volume = self.volume.lock().unwrap();
         if let Some(volume) = volume.as_ref() {
-            return Ok(volume.clone());
+            return Ok(Some(volume.clone()));
         }
-        let opened = Arc::new(match self.info.fs {
+        let fs = if self.info.fs.is_encrypted() {
+            if !self.is_unlocked(image, keys)? {
+                return Ok(None);
+            }
+            // The plaintext can hold anything a partition can.
+            partition::detect_fs(&mut self.slice(image), 0)?
+        } else {
+            self.info.fs
+        };
+        let opened = Arc::new(match fs {
             FsKind::Ntfs => Volume::Ntfs(NtfsVolume::open(&mut self.slice(image))?),
             FsKind::Fat => Volume::Fat,
             FsKind::Ext => Volume::Ext,
@@ -150,7 +204,50 @@ impl OpenPartition {
             }
         });
         *volume = Some(opened.clone());
-        Ok(opened)
+        Ok(Some(opened))
+    }
+
+    /// Whether the encrypted partition is unlocked, unlocking it first if the session knows its key.
+    fn is_unlocked(&self, image: &ImageReader, keys: &KeyCache) -> Result<bool> {
+        if self.unlocked.lock().unwrap().is_some() {
+            return Ok(true);
+        }
+        let id = crypt::volume_id(self.info.fs, &mut self.raw(image))?;
+        let Some(secret) = keys.lock().unwrap().get(&id).cloned() else {
+            return Ok(false);
+        };
+        match crypt::unlock(self.info.fs, self.raw(image), &secret) {
+            Ok(plain) => {
+                *self.unlocked.lock().unwrap() = Some(plain);
+                Ok(true)
+            }
+            // Not the key of this volume any more, e.g. it was encrypted anew: ask again.
+            Err(Error::WrongPassword) => {
+                keys.lock().unwrap().remove(&id);
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Unlocks the encrypted partition with `secret` and remembers it for the session.
+    fn unlock(&self, image: &ImageReader, secret: &str, keys: &KeyCache) -> Result<()> {
+        if !self.info.fs.is_encrypted() {
+            return Err(Error::Image(format!("“{}” is not encrypted", self.name())));
+        }
+        let plain = crypt::unlock(self.info.fs, self.raw(image), secret)?;
+        let id = crypt::volume_id(self.info.fs, &mut self.raw(image))?;
+        {
+            // Same order as in `volume()`. A filesystem opened before is dropped, it was read
+            // from the other source.
+            let mut volume = self.volume.lock().unwrap();
+            *self.unlocked.lock().unwrap() = Some(plain);
+            *volume = None;
+        }
+        keys.lock()
+            .unwrap()
+            .insert(id, Secret::new(secret.to_owned()));
+        Ok(())
     }
 }
 
@@ -166,7 +263,7 @@ impl ImageCache {
                 .map(|p| partition_entry(p, image.path))
                 .collect());
         };
-        match &*partition.volume(&open.reader)? {
+        match &*open.volume(partition, &self.keys)? {
             Volume::Ntfs(volume) => {
                 volume.list(&mut partition.slice(&open.reader), rest, &virtual_path)
             }
@@ -185,7 +282,7 @@ impl ImageCache {
         let (partition, rest) = open
             .partition(inner)?
             .ok_or_else(|| Error::NotAFile(shown.clone()))?;
-        match &*partition.volume(&open.reader)? {
+        match &*open.volume(partition, &self.keys)? {
             Volume::Ntfs(volume) => {
                 volume.write_file(&mut partition.slice(&open.reader), rest, &shown, out)
             }
@@ -195,6 +292,18 @@ impl ImageCache {
                 volume.write_file(|| partition.slice(&open.reader), rest, &shown, out)
             }
         }
+    }
+
+    /// Unlocks the encrypted partition that `inner` is or lies in, with a recovery password or
+    /// passphrase, and remembers it for the session.
+    ///
+    /// Fails with [`Error::WrongPassword`] if the secret doesn't fit the volume.
+    pub fn unlock(&self, image: &ImageRef, inner: &Path, secret: &str) -> Result<()> {
+        let open = self.open(image)?;
+        let (partition, _) = open
+            .partition(inner)?
+            .ok_or_else(|| Error::NotFound(image.path.join(inner)))?;
+        partition.unlock(&open.reader, secret, &self.keys)
     }
 
     /// The opened image, reading its partition table if it isn't open yet.
@@ -233,6 +342,7 @@ impl ImageCache {
                 drive: drives.iter().find(|d| d.0 == info.start).map(|d| d.1),
                 info,
                 volume: Mutex::new(None),
+                unlocked: Mutex::new(None),
             })
             .collect();
         let open = Arc::new(OpenImage {
@@ -252,6 +362,14 @@ impl ImageCache {
 }
 
 impl OpenImage {
+    /// The filesystem of `partition`; fails with [`Error::VolumeLocked`] if it is encrypted and
+    /// the session doesn't know its key.
+    fn volume(&self, partition: &OpenPartition, keys: &KeyCache) -> Result<Arc<Volume>> {
+        partition
+            .volume(&self.reader, keys)?
+            .ok_or_else(|| Error::VolumeLocked(self.key.1.join(partition.name())))
+    }
+
     /// The partition named by the first component of `inner`, and the rest of the path.
     fn partition<'p>(&self, inner: &'p Path) -> Result<Option<(&OpenPartition, &'p Path)>> {
         let mut components = inner.components();
@@ -281,11 +399,15 @@ fn partition_entry(partition: &OpenPartition, image_path: &Path) -> Entry {
     Entry {
         path: image_path.join(&name),
         name,
-        kind: match partition.info.fs.unsupported_reason() {
-            None => EntryKind::Partition,
-            Some(reason) => EntryKind::Unavailable {
-                reason: reason.to_owned(),
-            },
+        kind: if partition.info.fs.is_encrypted() {
+            EntryKind::Encrypted
+        } else {
+            match partition.info.fs.unsupported_reason() {
+                None => EntryKind::Partition,
+                Some(reason) => EntryKind::Unavailable {
+                    reason: reason.to_owned(),
+                },
+            }
         },
         size: partition.info.len,
         mtime: None,

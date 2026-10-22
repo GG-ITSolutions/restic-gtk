@@ -20,7 +20,10 @@ pub enum EntryKind {
     DiskImage,
     /// A partition of a disk image, browsed like a folder.
     Partition,
-    /// A partition of a disk image that can't be browsed, e.g. an encrypted one.
+    /// An encrypted partition of a disk image (BitLocker, LUKS), browsed like a folder once
+    /// its key is known.
+    Encrypted,
+    /// A partition of a disk image that can't be browsed, e.g. one with an unsupported filesystem.
     Unavailable {
         reason: String,
     },

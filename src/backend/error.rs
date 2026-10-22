@@ -34,6 +34,11 @@ pub enum Error {
     #[error("{0}")]
     UnsupportedFilesystem(String),
 
+    /// An encrypted partition of a disk image, given by its path, that has to be unlocked first,
+    /// see [`Session::unlock_volume`](super::Session::unlock_volume).
+    #[error("“{0}” is encrypted and locked")]
+    VolumeLocked(PathBuf),
+
     /// A disk image that can't be read, e.g. a damaged filesystem.
     #[error("{0}")]
     Image(String),

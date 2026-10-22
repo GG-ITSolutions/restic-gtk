@@ -39,6 +39,10 @@ no `restic` binary is needed.
   so are files that can't be read (EFS-encrypted, deduplicated, WIMBoot) and LVM volumes of a
   type that can't be read (thin, striped, snapshots). ext hard links are restored as separate
   files.
+- **Encrypted partitions** in disk images (BitLocker, LUKS1 and LUKS2) show a lock. Opening one
+  asks for the BitLocker recovery key or password, or the LUKS passphrase. The key is not stored;
+  until you lock the repository or quit, it stays in memory, so the same volume in other
+  snapshots opens without asking again. Restoring from a partition that is still locked fails.
 - **Restore** selected files and folders into a folder of your choice, as
   `<folder>/<name>`. Before existing files are replaced, their number is shown and must be
   confirmed, then the restore shows its progress. A folder, file or link of another type in
@@ -87,12 +91,12 @@ New files must be known to git (`git add`), otherwise the flake doesn't see them
 - An unreachable endpoint fails only after about a minute, rustic retries every request.
 - A running restore can't be cancelled; rustic_core offers no way to abort it.
 - Restoring to non-UTF-8 target paths is not supported.
-- Disk images: BitLocker and LUKS and compressed images (`.img.gz`) can't be browsed yet. Of
-  the VM disk formats, qcow2 with a backing file, VHD/VHDX differencing disks, VMDK snapshots,
-  encrypted or extended-L2 qcow2 and VHDX files with a log to replay are refused. The extent
-  files of a VMDK (`-flat`, `-s001`, ...) show up as images of their own. Restoring from
-  images keeps no permissions, owners or alternate data streams. Changes still in the NTFS
-  journal of an image of a running system are not applied.
+- Disk images: compressed images (`.img.gz`) can't be browsed yet. Of the VM disk formats,
+  qcow2 with a backing file, VHD/VHDX differencing disks, VMDK snapshots, encrypted or
+  extended-L2 qcow2 and VHDX files with a log to replay are refused. The extent files of a VMDK
+  (`-flat`, `-s001`, ...) show up as images of their own. Restoring from images keeps no
+  permissions, owners or alternate data streams. Changes still in the NTFS journal of an image
+  of a running system are not applied.
 - LVM volumes are browsable only if linear or mirrored (RAID1) on the one physical volume of
   the image; thin, striped, snapshot and RAID5/6 volumes and volume groups spanning several
   images are listed as unavailable. ext filesystems with unsupported features (see the
@@ -100,6 +104,11 @@ New files must be known to git (`git add`), otherwise the flake doesn't see them
   on restore, as are files with a time before 1970. Images of running (not cleanly unmounted)
   ext3/ext4 systems can only be browsed if the filesystem has the 64bit feature and its
   journal uses checksum v3 (journal_checksum, the default on current ext4).
+- Encrypted volumes need a recovery key, password or passphrase. BitLocker volumes protected
+  only by the TPM, `.BEK` key files, AES-256-CBC with Elephant diffuser and Windows Vista volumes
+  can't be opened, nor can LUKS volumes with another cipher than AES-XTS, with key files, or
+  unlocked only by a TPM2 or FIDO2 token. LUKS2 volumes with Argon2 take a few seconds to
+  unlock, a bit longer than with cryptsetup, which uses several threads.
 - Fragmented files in disk images are slow to open: every scattered piece fetches a whole blob
   (about 1 MiB) from the repository. Logs with NTFS compression are typical, a 79 MB Windows
   CBS log took about 90 s from a rest-server over the internet.

@@ -376,7 +376,7 @@ impl Session {
                 .expect("entries of an image are below it")
                 .to_path_buf();
             match entry.kind {
-                EntryKind::Dir | EntryKind::Partition => {
+                EntryKind::Dir | EntryKind::Partition | EntryKind::Encrypted => {
                     check_existing(&destination, |kind| Ok(kind.is_dir()))?;
                     let children = match self.images.list(&image, &inner) {
                         // An encrypted folder below the picked entry is left out like a link.

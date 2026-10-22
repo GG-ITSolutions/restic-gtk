@@ -9,6 +9,7 @@ mod repo_dialog;
 mod restore_dialog;
 mod snapshots_page;
 mod unlock_dialog;
+mod volume_dialog;
 mod window;
 
 use gtk::{gio, glib, prelude::*};

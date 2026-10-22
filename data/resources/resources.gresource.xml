@@ -6,6 +6,7 @@
     <file compressed="true" preprocess="xml-stripblanks">ui/restore-dialog.ui</file>
     <file compressed="true" preprocess="xml-stripblanks">ui/snapshots-page.ui</file>
     <file compressed="true" preprocess="xml-stripblanks">ui/unlock-dialog.ui</file>
+    <file compressed="true" preprocess="xml-stripblanks">ui/volume-dialog.ui</file>
     <file compressed="true" preprocess="xml-stripblanks">ui/window.ui</file>
     <file compressed="true">style.css</file>
   </gresource>

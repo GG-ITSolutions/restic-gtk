@@ -17,18 +17,31 @@ pub enum FsKind {
 }
 
 impl FsKind {
+    /// Whether the partition has to be unlocked with a key to see its filesystem.
+    pub fn is_encrypted(self) -> bool {
+        matches!(self, Self::BitLocker | Self::Luks)
+    }
+
     /// Why the partition can't be browsed, for kinds that can't.
     pub fn unsupported_reason(self) -> Option<&'static str> {
         Some(match self {
             Self::Ntfs | Self::Fat | Self::Ext | Self::Lvm => return None,
-            Self::BitLocker => "Encrypted with BitLocker, which can't be browsed yet",
-            Self::Luks => "Encrypted with LUKS, which can't be browsed yet",
+            // Only met inside another encrypted volume, see `is_encrypted`.
+            Self::BitLocker | Self::Luks => {
+                "Encrypted volumes inside encrypted volumes can't be browsed"
+            }
             Self::ExFat => "exFAT filesystems can't be browsed yet",
             Self::Refs => "ReFS filesystems can't be browsed",
             Self::Unknown => "No supported filesystem",
         })
     }
 }
+
+/// The GUID in the boot sector of BitLocker To Go volumes (at offset 424), whose boot sector
+/// looks like that of a FAT volume otherwise.
+const BITLOCKER_TO_GO_GUID: [u8; 16] = [
+    0x3b, 0xd6, 0x67, 0x49, 0x29, 0x2e, 0xd8, 0x4a, 0x83, 0x99, 0xf6, 0xa3, 0x39, 0xe3, 0xd0, 0x01,
+];
 
 /// A partition of a disk image, or the whole image if it has no partition table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,7 +166,7 @@ fn detect_fs_in(head: &[u8]) -> FsKind {
     let boot_signature = at(510, &[0x55, 0xAA]);
     if at(3, b"NTFS    ") {
         FsKind::Ntfs
-    } else if at(3, b"-FVE-FS-") {
+    } else if at(3, b"-FVE-FS-") || at(424, &BITLOCKER_TO_GO_GUID) {
         FsKind::BitLocker
     } else if at(3, b"EXFAT   ") {
         FsKind::ExFat
@@ -197,6 +210,11 @@ mod tests {
         };
         assert_eq!(detect_fs_in(&with(3, b"NTFS    ")), FsKind::Ntfs);
         assert_eq!(detect_fs_in(&with(3, b"-FVE-FS-")), FsKind::BitLocker);
+        // BitLocker To Go: a FAT boot sector with the GUID of BitLocker.
+        let mut to_go = with(424, &BITLOCKER_TO_GO_GUID);
+        to_go[510..512].copy_from_slice(&[0x55, 0xAA]);
+        to_go[0x52..0x5A].copy_from_slice(b"FAT32   ");
+        assert_eq!(detect_fs_in(&to_go), FsKind::BitLocker);
         assert_eq!(detect_fs_in(&with(0, b"LUKS\xba\xbe")), FsKind::Luks);
         for sector in 0..4 {
             assert_eq!(detect_fs_in(&with(sector * 512, b"LABELONE")), FsKind::Lvm);

@@ -225,6 +225,29 @@ impl Session {
         }
     }
 
+    /// Unlocks the encrypted partition of a disk image that `path` is or lies in.
+    ///
+    /// `secret` is a BitLocker recovery password (48 digits, dashes optional), a BitLocker
+    /// password or a LUKS passphrase. Fails with [`Error::WrongPassword`] if it doesn't fit.
+    /// The secret stays in memory until the session ends, so the volume opens again without
+    /// asking, also in other snapshots. This runs the key derivation, from 0.1 s (BitLocker) to
+    /// several seconds (LUKS2).
+    pub fn unlock_volume(&self, snapshot: &Snapshot, path: &Path, secret: &str) -> Result<()> {
+        let repo = self.indexed()?;
+        match self.locate(&repo, snapshot, path)? {
+            Location::Image {
+                node,
+                path: image_path,
+                inner,
+                siblings,
+            } => {
+                let image = self.image_ref(&repo, snapshot, &node, &image_path, siblings);
+                self.images.unlock(&image, &inner, secret)
+            }
+            Location::Node(_) => Err(Error::NotFound(path.to_path_buf())),
+        }
+    }
+
     /// The contents of the folder at `path`: folders first, then by name.
     ///
     /// Disk images are folders of their partitions here, see [`image`].

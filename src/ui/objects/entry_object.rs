@@ -50,6 +50,7 @@ impl EntryObject {
                 EntryKind::Special => "application-x-executable-symbolic",
                 EntryKind::DiskImage => "drive-harddisk-symbolic",
                 EntryKind::Partition => "drive-harddisk-system-symbolic",
+                EntryKind::Encrypted => "changes-prevent-symbolic",
                 EntryKind::Unavailable { .. } => "action-unavailable-symbolic",
             }
             .into(),
@@ -58,6 +59,7 @@ impl EntryObject {
             EntryKind::File
             | EntryKind::DiskImage
             | EntryKind::Partition
+            | EntryKind::Encrypted
             | EntryKind::Unavailable { .. } => format::size(entry.size),
             _ => String::new(),
         });

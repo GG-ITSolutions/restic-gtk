@@ -32,6 +32,11 @@ embedded-io = { version = "0.6", features = ["std"] }
 # Container formats of disk images: compressed qcow2 clusters and VMDK grains.
 miniz_oxide = "0.9"
 zstd = "0.13"
+# Encrypted volumes in disk images. Young crates by one author: pinned, and kept behind
+# src/backend/image/crypt.rs so they can be swapped for an own implementation.
+bitlocker-core = "=0.3.5"
+luks-core = "=0.1.8"
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"
