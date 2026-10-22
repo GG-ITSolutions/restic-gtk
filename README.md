@@ -43,6 +43,9 @@ no `restic` binary is needed.
   asks for the BitLocker recovery key or password, or the LUKS passphrase. The key is not stored;
   until you lock the repository or quit, it stays in memory, so the same volume in other
   snapshots opens without asking again. Restoring from a partition that is still locked fails.
+- **ZIP archives** (`.zip`) open like folders, without downloading them: only the list of
+  entries and the entries you open are read. Files and folders inside can be restored with
+  their modification time. A `.zip` file that is not a ZIP archive opens like any other file.
 - **Restore** selected files and folders into a folder of your choice, as
   `<folder>/<name>`. Before existing files are replaced, their number is shown and must be
   confirmed, then the restore shows its progress. A folder, file or link of another type in
@@ -109,6 +112,13 @@ New files must be known to git (`git add`), otherwise the flake doesn't see them
   can't be opened, nor can LUKS volumes with another cipher than AES-XTS, with key files, or
   unlocked only by a TPM2 or FIDO2 token. LUKS2 volumes with Argon2 take a few seconds to
   unlock, a bit longer than with cryptsetup, which uses several threads.
+- ZIP archives: only `.zip` opens as a folder, not `.docx`, `.jar` and the like. Encrypted
+  entries and entries compressed with Zstandard or PPMd are listed but can't be opened or
+  restored, there is no password prompt yet. Links are listed and not restored, multi-part
+  archives (`.z01`) are not supported, and archives with more than 500,000 entries are
+  opened as a plain file. Names in code pages other than UTF-8 and CP437 may look garbled,
+  times (stored without a time zone) are taken as local time of this computer. A ZIP inside a
+  ZIP or disk image is extracted completely before it opens.
 - Fragmented files in disk images are slow to open: every scattered piece fetches a whole blob
   (about 1 MiB) from the repository. Logs with NTFS compression are typical, a 79 MB Windows
   CBS log took about 90 s from a rest-server over the internet.

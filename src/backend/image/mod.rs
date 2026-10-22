@@ -17,6 +17,8 @@ mod reader;
 mod system_json;
 mod wof;
 
+pub(crate) use reader::SnapshotReader;
+
 use std::{
     collections::HashMap,
     ffi::OsStr,
@@ -35,7 +37,7 @@ use self::{
     lvm::LvmVolume,
     ntfs::NtfsVolume,
     partition::{FsKind, Partition},
-    reader::{Slice, SnapshotReader},
+    reader::Slice,
 };
 use super::{Entry, EntryKind, Error, Result, session::IndexedRepo};
 

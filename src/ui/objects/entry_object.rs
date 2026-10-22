@@ -49,6 +49,7 @@ impl EntryObject {
                 EntryKind::Symlink { .. } => "emblem-symbolic-link-symbolic",
                 EntryKind::Special => "application-x-executable-symbolic",
                 EntryKind::DiskImage => "drive-harddisk-symbolic",
+                EntryKind::ZipArchive => "package-x-generic-symbolic",
                 EntryKind::Partition => "drive-harddisk-system-symbolic",
                 EntryKind::Encrypted => "changes-prevent-symbolic",
                 EntryKind::Unavailable { .. } => "action-unavailable-symbolic",
@@ -58,6 +59,7 @@ impl EntryObject {
         imp.size_label.replace(match entry.kind {
             EntryKind::File
             | EntryKind::DiskImage
+            | EntryKind::ZipArchive
             | EntryKind::Partition
             | EntryKind::Encrypted
             | EntryKind::Unavailable { .. } => format::size(entry.size),

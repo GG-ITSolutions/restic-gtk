@@ -8,14 +8,14 @@ use std::{
 
 use uuid::Uuid;
 
-use super::{Error, Result, Session, Snapshot, session::Location};
+use super::{Error, Result, Session, Snapshot, archive::ZipRef, session::Location};
 
 impl Session {
     /// Writes the file at `path` to a new, read-only file below `dir` and returns its path.
     ///
     /// Each extraction gets its own subfolder, so the file keeps its name and
     /// repeated or same-named extractions don't collide. Files inside disk images
-    /// are read from the image, which is not downloaded as a whole.
+    /// and ZIP archives are read from them, they are not downloaded as a whole.
     pub fn extract_file(&self, snapshot: &Snapshot, path: &Path, dir: &Path) -> Result<PathBuf> {
         let repo = self.indexed()?;
         match self.locate(&repo, snapshot, path)? {
@@ -31,7 +31,20 @@ impl Session {
                 let image = self.image_ref(&repo, snapshot, &node, &image_path, siblings);
                 extract_to(dir, name, |out| self.images.write_file(&image, &inner, out))
             }
-            Location::Image { node, .. } | Location::Node(node) => {
+            Location::Archive {
+                node,
+                path: zip_path,
+                inner,
+            } if inner.components().next().is_some() => {
+                let name = path
+                    .file_name()
+                    .ok_or_else(|| Error::NotAFile(path.to_path_buf()))?;
+                let zip = ZipRef::new(&repo, snapshot, &node, &zip_path);
+                extract_to(dir, name, |out| self.zips.write_file(&zip, &inner, out))
+            }
+            Location::Image { node, .. }
+            | Location::Archive { node, .. }
+            | Location::Node(node) => {
                 if !node.is_file() {
                     return Err(Error::NotAFile(path.to_path_buf()));
                 }

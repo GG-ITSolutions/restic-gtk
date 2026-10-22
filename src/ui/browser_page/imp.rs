@@ -7,7 +7,9 @@ use std::{
 use adw::{prelude::*, subclass::prelude::*};
 use gtk::{CompositeTemplate, gdk, gio, glib, glib::clone};
 use restic_gtk::{
-    backend::{EntryKind, Error, RestoreRequest, Snapshot, is_disk_image, jiff::Timestamp},
+    backend::{
+        EntryKind, Error, RestoreRequest, Snapshot, is_disk_image, is_zip_archive, jiff::Timestamp,
+    },
     config,
 };
 
@@ -201,11 +203,11 @@ impl BrowserPage {
 
     /// Starts in the backed up folder if there is exactly one, which is where the files are.
     ///
-    /// Not in a disk image though: the other files of the snapshot, e.g. a
+    /// Not in a disk image or ZIP archive though: the other files of the snapshot, e.g. a
     /// `system.json` next to it, would be out of sight.
     fn load_start_folder(&self) {
         match self.snapshot().paths.as_slice() {
-            [single] if !is_disk_image(Path::new(single)) => {
+            [single] if !is_disk_image(Path::new(single)) && !is_zip_archive(Path::new(single)) => {
                 self.load_dir(PathBuf::from(single), true)
             }
             _ => self.load_dir(PathBuf::from("/"), false),
@@ -277,6 +279,12 @@ impl BrowserPage {
                             imp.load_dir(path, false);
                         }
                     }
+                    // Named like an archive, but isn't one: open it as the file it is.
+                    Err(Error::NotAnArchive(reason)) => {
+                        imp.stack.set_visible_child_name("list");
+                        show_toast(&obj, &format!("{reason}. Opening it as a file instead."));
+                        imp.open_file(path);
+                    }
                     Err(_) if fall_back_to_root => imp.load_dir(PathBuf::from("/"), false),
                     Err(err) => {
                         imp.entries.remove_all();
@@ -320,6 +328,7 @@ impl BrowserPage {
                 EntryKind::Dir
                     | EntryKind::File
                     | EntryKind::DiskImage
+                    | EntryKind::ZipArchive
                     | EntryKind::Partition
                     | EntryKind::Encrypted
             )
@@ -347,9 +356,11 @@ impl BrowserPage {
     fn activate_entry(&self, entry: &EntryObject) {
         let entry = entry.entry();
         match &entry.kind {
-            EntryKind::Dir | EntryKind::DiskImage | EntryKind::Partition | EntryKind::Encrypted => {
-                self.load_dir(entry.path.clone(), false)
-            }
+            EntryKind::Dir
+            | EntryKind::DiskImage
+            | EntryKind::ZipArchive
+            | EntryKind::Partition
+            | EntryKind::Encrypted => self.load_dir(entry.path.clone(), false),
             EntryKind::File => self.open_file(entry.path.clone()),
             EntryKind::Symlink { target } => show_toast(
                 &*self.obj(),

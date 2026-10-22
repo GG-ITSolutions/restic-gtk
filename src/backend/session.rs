@@ -13,6 +13,7 @@ use rustic_core::{
 
 use super::{
     Entry, Error, ProgressUpdate, RepoConfig, Result, Snapshot,
+    archive::{self, ZipCache, ZipRef},
     image::{self, ImageCache, ImageRef},
     progress::{ProgressCallback, ProgressRouter},
     s3,
@@ -35,6 +36,14 @@ pub(crate) enum Location {
         /// The files in the folder of the image, itself included.
         siblings: Vec<Node>,
     },
+    /// A ZIP archive file, or a path inside it.
+    Archive {
+        node: Node,
+        /// The path of the archive file.
+        path: PathBuf,
+        /// The path inside the archive, empty for the archive itself.
+        inner: PathBuf,
+    },
 }
 
 /// An unlocked repository.
@@ -54,6 +63,7 @@ pub struct Session {
     /// Serializes operations that report progress, the router has one slot.
     progress_slot: Mutex<()>,
     pub(crate) images: ImageCache,
+    pub(crate) zips: ZipCache,
 }
 
 impl Session {
@@ -89,6 +99,7 @@ impl Session {
             progress,
             progress_slot: Mutex::new(()),
             images: ImageCache::default(),
+            zips: ZipCache::default(),
         })
     }
 
@@ -168,7 +179,7 @@ impl Session {
         Ok(repo.node_from_path(snapshot.tree, path)?)
     }
 
-    /// Finds what `path` refers to, stopping at the first disk image on the way.
+    /// Finds what `path` refers to, stopping at the first disk image or ZIP archive on the way.
     pub(crate) fn locate(
         &self,
         repo: &IndexedRepo,
@@ -193,6 +204,13 @@ impl Session {
                     path: walked,
                     inner: components.as_path().to_path_buf(),
                     siblings: nodes,
+                });
+            }
+            if archive::is_zip_file(name, node.meta.size) && node.is_file() {
+                return Ok(Location::Archive {
+                    node: node.clone(),
+                    path: walked,
+                    inner: components.as_path().to_path_buf(),
                 });
             }
             match node.subtree {
@@ -244,13 +262,16 @@ impl Session {
                 let image = self.image_ref(&repo, snapshot, &node, &image_path, siblings);
                 self.images.unlock(&image, &inner, secret)
             }
-            Location::Node(_) => Err(Error::NotFound(path.to_path_buf())),
+            Location::Node(_) | Location::Archive { .. } => {
+                Err(Error::NotFound(path.to_path_buf()))
+            }
         }
     }
 
     /// The contents of the folder at `path`: folders first, then by name.
     ///
-    /// Disk images are folders of their partitions here, see [`image`].
+    /// Disk images are folders of their partitions here, see [`image`], and ZIP archives
+    /// folders of their entries, see [`archive`].
     pub fn list_dir(&self, snapshot: &Snapshot, path: &Path) -> Result<Vec<Entry>> {
         let repo = self.indexed()?;
         let mut entries: Vec<Entry> = match self.locate(&repo, snapshot, path)? {
@@ -274,6 +295,13 @@ impl Session {
                 let image = self.image_ref(&repo, snapshot, &node, &image_path, siblings);
                 self.images.list(&image, &inner)?
             }
+            Location::Archive {
+                node,
+                path: zip_path,
+                inner,
+            } => self
+                .zips
+                .list(&ZipRef::new(&repo, snapshot, &node, &zip_path), &inner)?,
         };
         entries.sort_by(compare_entries);
         Ok(entries)

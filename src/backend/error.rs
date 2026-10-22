@@ -43,6 +43,15 @@ pub enum Error {
     #[error("{0}")]
     Image(String),
 
+    /// A ZIP archive entry that can't be read, e.g. a damaged one.
+    #[error("{0}")]
+    Archive(String),
+
+    /// A file that is named like an archive but can't be browsed as one, e.g. not a ZIP file.
+    /// Opening it as a plain file still works.
+    #[error("{0}")]
+    NotAnArchive(String),
+
     /// The restore target has something else where an entry goes.
     #[error("“{path}” already exists as {existing}")]
     TargetExists {

@@ -24,6 +24,8 @@ gptman = "3"
 mbrman = "0.6"
 ntfs = "0.4"
 fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"] }
+# ZIP archives in snapshots. No zstd (a second zstd crate version) and no encryption.
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "bzip2", "lzma", "xz"] }
 lznt1 = "0.1"
 xpress-huffman = "0.1"
 ext4-view = { version = "1", features = ["std"] }
