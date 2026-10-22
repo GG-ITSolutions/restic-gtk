@@ -4,6 +4,7 @@
 //! `/disk0.img/Partition 3 (C:)/Users`. The first level below the image are its
 //! partitions, below that the files of the filesystem.
 
+mod container;
 mod fat;
 mod lznt1;
 mod lzx;
@@ -12,8 +13,6 @@ mod partition;
 mod reader;
 mod system_json;
 mod wof;
-
-pub(crate) use system_json::FILE_NAME as SYSTEM_JSON;
 
 use std::{
     ffi::OsStr,
@@ -25,6 +24,7 @@ use std::{
 use rustic_core::repofile::Node;
 
 use self::{
+    container::Disk,
     fat::FatVolume,
     ntfs::NtfsVolume,
     partition::{FsKind, Partition},
@@ -32,8 +32,11 @@ use self::{
 };
 use super::{Entry, EntryKind, Error, Result, session::IndexedRepo};
 
-/// File name extensions of raw disk images.
-const EXTENSIONS: [&str; 3] = ["img", "raw", "dd"];
+/// File name extensions of raw disk images and VM disks.
+const EXTENSIONS: [&str; 8] = ["img", "raw", "dd", "qcow2", "qcow", "vhd", "vhdx", "vmdk"];
+
+/// The virtual disk of an image file in a snapshot, whatever its container format.
+type ImageReader = Disk<SnapshotReader>;
 
 /// Images kept open per session; each holds its partition table and filesystems.
 const OPEN_IMAGES: usize = 2;
@@ -73,13 +76,22 @@ pub(crate) struct ImageRef<'a> {
     pub node: &'a Node,
     /// The path of the image file in the snapshot.
     pub path: &'a Path,
-    /// A `system.json` next to the image, if there is one.
-    pub system_json: Option<Node>,
+    /// The files in the folder of the image, itself included.
+    pub siblings: Vec<Node>,
+}
+
+impl ImageRef<'_> {
+    /// The file `name` next to the image (exact name).
+    pub fn sibling(&self, name: &str) -> Option<&Node> {
+        self.siblings
+            .iter()
+            .find(|n| n.is_file() && n.name() == OsStr::new(name))
+    }
 }
 
 struct OpenImage {
     key: (String, PathBuf),
-    reader: SnapshotReader,
+    reader: ImageReader,
     partitions: Vec<OpenPartition>,
 }
 
@@ -107,11 +119,11 @@ impl OpenPartition {
         }
     }
 
-    fn slice(&self, image: &SnapshotReader) -> Slice<SnapshotReader> {
+    fn slice(&self, image: &ImageReader) -> Slice<ImageReader> {
         Slice::new(image.clone(), self.info.start, self.info.len)
     }
 
-    fn volume(&self, image: &SnapshotReader) -> Result<Arc<Volume>> {
+    fn volume(&self, image: &ImageReader) -> Result<Arc<Volume>> {
         let mut volume = self.volume.lock().unwrap();
         if let Some(volume) = volume.as_ref() {
             return Ok(volume.clone());
@@ -178,13 +190,21 @@ impl ImageCache {
         }
 
         // Read without holding the lock; a concurrent caller may open it as well.
-        let mut reader = SnapshotReader::new(image.repo.clone(), image.node)?;
+        let sibling = |name: &str| {
+            image
+                .sibling(name)
+                .map(|node| SnapshotReader::new(image.repo.clone(), node))
+                .transpose()
+        };
+        let mut reader = container::open(
+            SnapshotReader::new(image.repo.clone(), image.node)?,
+            &sibling,
+        )?;
         let size = reader.size();
         let table = partition::read_partitions(&mut reader, size)?;
         let image_name = image.path.file_name().unwrap_or_default();
         let drives = image
-            .system_json
-            .as_ref()
+            .sibling(system_json::FILE_NAME)
             .and_then(|node| system_json::drive_letters(image.repo, node, image_name))
             .unwrap_or_default();
         let partitions = table

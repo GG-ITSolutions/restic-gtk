@@ -675,17 +675,20 @@ const LINUX_TYPE: [u8; 16] = [
     0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4,
 ];
 
-/// The NTFS volume of `tests/fixtures/generate-ntfs.sh`.
-fn ntfs_volume() -> Vec<u8> {
-    let file =
-        fs::File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ntfs.img.zst"))
-            .unwrap();
-    let mut volume = Vec::new();
+/// The decompressed zstd fixture at `path`.
+fn unzstd(path: &Path) -> Vec<u8> {
+    let file = fs::File::open(path).unwrap();
+    let mut data = Vec::new();
     ruzstd::decoding::StreamingDecoder::new(file)
         .unwrap()
-        .read_to_end(&mut volume)
+        .read_to_end(&mut data)
         .unwrap();
-    volume
+    data
+}
+
+/// The NTFS volume of `tests/fixtures/generate-ntfs.sh`.
+fn ntfs_volume() -> Vec<u8> {
+    unzstd(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ntfs.img.zst"))
 }
 
 /// A FAT volume with `/EFI/BOOT/hello.txt`.
@@ -1025,4 +1028,240 @@ fn restore_from_a_disk_image_checks_the_target_first() {
         matches!(result, Err(Error::UnsupportedFilesystem(_))),
         "{result:?}"
     );
+}
+
+// VM disk formats: the NTFS volume in qcow2, VHD, VHDX and VMDK containers.
+
+/// A VM disk of `tests/fixtures/generate-containers.sh`.
+fn container(name: &str) -> Vec<u8> {
+    unzstd(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/containers")
+            .join(format!("{name}.zst")),
+    )
+}
+
+/// A snapshot whose `/data` holds `files`.
+fn with_files(files: &[(&str, Vec<u8>)]) -> Fixture {
+    Fixture::with_source(|source| {
+        for (name, data) in files {
+            fs::write(source.join(name), data).unwrap();
+        }
+    })
+}
+
+fn vmdk_descriptor(create_type: &str, parent_cid: &str, extents: &[&str]) -> Vec<u8> {
+    format!(
+        "# Disk DescriptorFile\nversion=1\nCID=12345678\nparentCID={parent_cid}\n\
+         createType=\"{create_type}\"\n\n# Extent description\n{}\n\n# The Disk Data Base\n#DDB\n",
+        extents.join("\n")
+    )
+    .into_bytes()
+}
+
+/// Browses `/data/<image>` down to its files and reads them whole.
+fn check_ntfs_image(fixture: &Fixture, session: &Session, image: &str) {
+    let snapshot = fixture.snapshot(session);
+    let image = Path::new("/data").join(image);
+    let partitions = session.list_dir(&snapshot, &image).unwrap();
+    assert_eq!(names(&partitions), ["Partition 1"], "{image:?}");
+    let volume = image.join("Partition 1");
+    let root = session.list_dir(&snapshot, &volume).unwrap();
+    assert_eq!(
+        names(&root),
+        ["docs", "empty", "big.bin", "link"],
+        "{image:?}"
+    );
+    assert_eq!(root[2].size, 300_000);
+
+    let dir = fixture.dir.path().join("runtime");
+    let readme = session
+        .extract_file(&snapshot, &volume.join("docs/readme.txt"), &dir)
+        .unwrap();
+    assert_eq!(fs::read(readme).unwrap(), b"hello ntfs\n");
+    let big = session
+        .extract_file(&snapshot, &volume.join("big.bin"), &dir)
+        .unwrap();
+    let big = fs::read(big).unwrap();
+    assert!(
+        big.len() == 300_000
+            && big
+                .iter()
+                .enumerate()
+                .all(|(i, b)| *b == (i * 7 % 251) as u8),
+        "{image:?}"
+    );
+}
+
+#[test]
+fn browses_every_container_format() {
+    let images = [
+        "plain.qcow2",
+        "zlib.qcow2",
+        "zstd.qcow2",
+        "fixed.vhd",
+        "dynamic.vhd",
+        "fixed.vhdx",
+        "dynamic.vhdx",
+        "sparse.vmdk",
+        "stream.vmdk",
+    ];
+    let files: Vec<(&str, Vec<u8>)> = images.iter().map(|name| (*name, container(name))).collect();
+    let fixture = with_files(&files);
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let data = session.list_dir(&snapshot, Path::new("/data")).unwrap();
+    assert!(
+        data.iter().all(|e| e.kind == EntryKind::DiskImage),
+        "{data:?}"
+    );
+    for image in images {
+        check_ntfs_image(&fixture, &session, image);
+    }
+}
+
+#[test]
+fn browses_vmdk_descriptors() {
+    let ntfs = ntfs_volume();
+    let (first, second) = ntfs.split_at(ntfs.len() / 2);
+    let fixture = with_files(&[
+        (
+            "flat.vmdk",
+            vmdk_descriptor(
+                "monolithicFlat",
+                "ffffffff",
+                &["RW 8192 FLAT \"flat-flat.vmdk\" 0"],
+            ),
+        ),
+        ("flat-flat.vmdk", ntfs.clone()),
+        (
+            "split.vmdk",
+            vmdk_descriptor(
+                "twoGbMaxExtentFlat",
+                "ffffffff",
+                &[
+                    "RW 4096 FLAT \"split-f001.vmdk\" 0",
+                    "RW 4096 FLAT \"split-f002.vmdk\" 0",
+                ],
+            ),
+        ),
+        ("split-f001.vmdk", first.to_vec()),
+        ("split-f002.vmdk", second.to_vec()),
+        (
+            "sparse.vmdk",
+            vmdk_descriptor(
+                "twoGbMaxExtentSparse",
+                "ffffffff",
+                &["RW 8192 SPARSE \"sparse-s001.vmdk\""],
+            ),
+        ),
+        ("sparse-s001.vmdk", container("sparse.vmdk")),
+    ]);
+    let session = fixture.open();
+    for image in ["flat.vmdk", "split.vmdk", "sparse.vmdk"] {
+        check_ntfs_image(&fixture, &session, image);
+    }
+}
+
+#[test]
+fn refuses_images_that_need_a_parent() {
+    let mut vhd = container("dynamic.vhd");
+    let len = vhd.len();
+    for footer in [0, len - 512] {
+        vhd[footer + 60..footer + 64].copy_from_slice(&4u32.to_be_bytes());
+    }
+    let mut vhdx = container("dynamic.vhdx");
+    vhdx[0x31_0004] |= 2;
+    let descriptor =
+        |create_type, parent_cid, extent| vmdk_descriptor(create_type, parent_cid, &[extent]);
+    let cases = [
+        ("backing.qcow2", container("backing.qcow2"), "backing file"),
+        ("child.vmdk", container("child.vmdk"), "parent"),
+        ("diff.vhd", vhd, "parent"),
+        ("diff.vhdx", vhdx, "parent"),
+        (
+            "missing.vmdk",
+            descriptor(
+                "monolithicFlat",
+                "ffffffff",
+                "RW 8192 FLAT \"gone-flat.vmdk\" 0",
+            ),
+            "not in the snapshot",
+        ),
+        (
+            "path.vmdk",
+            descriptor(
+                "monolithicFlat",
+                "ffffffff",
+                "RW 8192 FLAT \"../x-flat.vmdk\" 0",
+            ),
+            "path",
+        ),
+        (
+            "type.vmdk",
+            descriptor("vmfsSparse", "ffffffff", "RW 8192 SPARSE \"x.vmdk\""),
+            "can't be browsed",
+        ),
+        (
+            "snap.vmdk",
+            descriptor(
+                "monolithicFlat",
+                "deadbeef",
+                "RW 8192 FLAT \"x-flat.vmdk\" 0",
+            ),
+            "parent",
+        ),
+    ];
+    let files: Vec<(&str, Vec<u8>)> = cases.iter().map(|c| (c.0, c.1.clone())).collect();
+    let fixture = with_files(&files);
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    let data = session.list_dir(&snapshot, Path::new("/data")).unwrap();
+    assert!(
+        data.iter().all(|e| e.kind == EntryKind::DiskImage),
+        "{data:?}"
+    );
+    for (name, _, word) in &cases {
+        let result = session.list_dir(&snapshot, &Path::new("/data").join(name));
+        assert!(
+            matches!(&result, Err(Error::Image(reason)) if reason.contains(word)),
+            "{name}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn restores_from_a_compressed_container() {
+    let fixture = with_files(&[("disk.qcow2", container("zlib.qcow2"))]);
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let target = fixture.folder("target");
+    let request = RestoreRequest {
+        items: vec![PathBuf::from("/data/disk.qcow2/Partition 1/docs")],
+        target: target.clone(),
+    };
+    let summary = session.restore(&snapshot, &request, |_| {}).unwrap();
+    assert_eq!(summary.skipped, 0);
+    assert_eq!(
+        fs::read_to_string(target.join("docs/readme.txt")).unwrap(),
+        "hello ntfs\n"
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("docs/sub/deep.txt")).unwrap(),
+        "deep\n"
+    );
+}
+
+#[test]
+fn recognizes_vm_disk_names() {
+    use restic_gtk::backend::is_disk_image;
+    for name in [
+        "a.qcow2", "a.QCOW2", "a.qcow", "a.vhd", "a.vhdx", "a.vmdk", "/x/y.img",
+    ] {
+        assert!(is_disk_image(Path::new(name)), "{name}");
+    }
+    for name in ["a.avhdx", "a.txt", "a.vmdk.txt", "a"] {
+        assert!(!is_disk_image(Path::new(name)), "{name}");
+    }
 }

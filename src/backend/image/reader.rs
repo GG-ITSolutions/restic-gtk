@@ -33,10 +33,6 @@ impl SnapshotReader {
             pos: 0,
         })
     }
-
-    pub fn size(&self) -> u64 {
-        self.size
-    }
 }
 
 impl Read for SnapshotReader {

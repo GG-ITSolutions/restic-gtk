@@ -23,12 +23,12 @@ impl Session {
                 node,
                 path: image_path,
                 inner,
-                system_json,
+                siblings,
             } if inner.components().next().is_some() => {
                 let name = path
                     .file_name()
                     .ok_or_else(|| Error::NotAFile(path.to_path_buf()))?;
-                let image = self.image_ref(&repo, snapshot, &node, &image_path, system_json);
+                let image = self.image_ref(&repo, snapshot, &node, &image_path, siblings);
                 extract_to(dir, name, |out| self.images.write_file(&image, &inner, out))
             }
             Location::Image { node, .. } | Location::Node(node) => {
