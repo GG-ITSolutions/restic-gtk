@@ -1,160 +1,82 @@
 //! LVM2 volume groups: the logical volumes of a physical volume, browsed like folders.
 
-use std::{
-    io::{self, Read, Seek, SeekFrom, Write},
-    path::{Component, Path},
-};
+use std::io::{self, Read, Seek, SeekFrom};
 
 use embedded_io::ErrorKind;
 use lamlvm::{LV, Lvm2, OpenLvError, OwnedLvReader};
 use rustic_core::jiff::Timestamp;
 
 use super::{
-    ext::ExtVolume,
     partition::{FsKind, detect_fs},
+    reader::Shared,
 };
-use crate::backend::{Entry, EntryKind, Error, Result};
+use crate::backend::{Error, Result};
 
-/// The parsed metadata of a volume group on one physical volume.
-///
-/// Holds no reader: every call gets a function that opens the physical volume anew, and builds
-/// the logical volume on top of that. A logical volume is a plain `Read + Seek`, so the
-/// filesystem on it is read like one on a partition.
-pub struct LvmVolume {
-    lvm: Lvm2,
+/// A visible logical volume of the volume group on a physical volume.
+pub struct LogicalVolume {
+    /// `<vg>-<lv>`, e.g. "vg0-root". Unlike the device mapper, hyphens inside the names are not
+    /// doubled (`my-vg` + `root` is "my-vg-root", not "my--vg-root").
+    pub name: String,
+    pub size: u64,
+    pub mtime: Option<Timestamp>,
+    /// The volume as block source and the filesystem at its start, or why it can't be read.
+    pub content: std::result::Result<(Shared, FsKind), String>,
 }
 
 /// A logical volume as `std::io` source, reading from the physical volume `R`.
 type LvReader<R> = ToStd<OwnedLvReader<FromStd<R>>>;
 
-impl LvmVolume {
-    pub fn open<R: Read + Seek>(pv: R) -> Result<Self> {
-        let lvm = Lvm2::open(FromStd(pv)).map_err(open_error)?;
-        Ok(Self { lvm })
-    }
-
-    /// The entries of the folder at `path` below the volume group, named below `parent`.
-    ///
-    /// The first level are the logical volumes, below them the files of their filesystems.
-    pub fn list<R: Read + Seek + 'static>(
-        &self,
-        open_pv: impl Fn() -> R,
-        path: &Path,
-        parent: &Path,
-    ) -> Result<Vec<Entry>> {
-        let Some((lv, rest)) = self.logical_volume(path, parent)? else {
-            return self.list_volumes(open_pv, parent);
+/// The visible logical volumes on the physical volume `pv`.
+///
+/// Only I/O errors (e.g. the network) and damaged metadata fail; a volume that can't be opened
+/// or probed says why in its `content`. The volumes read from clones of `pv`.
+pub fn logical_volumes<R>(pv: R) -> Result<Vec<LogicalVolume>>
+where
+    R: Read + Seek + Send + Clone + 'static,
+{
+    let lvm = Lvm2::open(FromStd(pv.clone())).map_err(open_error)?;
+    let mut volumes = Vec::new();
+    for lv in lvm.lvs().filter(is_visible) {
+        let content = match open_volume(&lvm, lv, pv.clone()) {
+            Ok(content) => Ok(content),
+            Err(Error::UnsupportedFilesystem(reason) | Error::Image(reason)) => Err(reason),
+            Err(err) => return Err(err),
         };
-        let mut reader = self.reader(lv, open_pv(), parent)?;
-        match filesystem(&mut reader)? {
-            FsKind::Ext => ExtVolume::list(reader, rest, parent),
-            other => Err(Error::UnsupportedFilesystem(reason(other).to_owned())),
+        volumes.push(LogicalVolume {
+            name: format!("{}-{}", lvm.vg_name(), lv.name()),
+            size: lv.size_in_extents().saturating_mul(lvm.extent_size()),
+            mtime: i64::try_from(lv.raw_metadata().creation_time)
+                .ok()
+                .filter(|&seconds| seconds > 0)
+                .and_then(|seconds| Timestamp::from_second(seconds).ok()),
+            content,
+        });
+    }
+    Ok(volumes)
+}
+
+/// `lv` over `pv` as block source, with the filesystem at its start.
+///
+/// `UnsupportedFilesystem` for types of logical volume that can't be read.
+fn open_volume<R>(lvm: &Lvm2, lv: LV<'_>, pv: R) -> Result<(Shared, FsKind)>
+where
+    R: Read + Seek + Send + 'static,
+{
+    let mut reader: LvReader<R> = match lvm.open_lv_owned_by_name(lv.name(), FromStd(pv)) {
+        Ok(Some(reader)) => ToStd(reader),
+        Ok(None) => {
+            return Err(Error::Image(
+                "The LVM volume is not in the metadata".to_owned(),
+            ));
         }
-    }
-
-    /// Writes the contents of the file at `path` to `out`.
-    pub fn write_file<R: Read + Seek + 'static>(
-        &self,
-        open_pv: impl Fn() -> R,
-        path: &Path,
-        shown: &Path,
-        out: &mut dyn Write,
-    ) -> Result<()> {
-        let (lv, rest) = self
-            .logical_volume(path, shown)?
-            .ok_or_else(|| Error::NotAFile(shown.to_path_buf()))?;
-        let mut reader = self.reader(lv, open_pv(), shown)?;
-        match filesystem(&mut reader)? {
-            FsKind::Ext => ExtVolume::write_file(reader, rest, shown, out),
-            other => Err(Error::UnsupportedFilesystem(reason(other).to_owned())),
+        Err(OpenLvError::Unsupported(detail)) => {
+            return Err(Error::UnsupportedFilesystem(unsupported_volume(lv, detail)));
         }
-    }
-
-    /// One entry per visible logical volume.
-    ///
-    /// A volume that can't be opened or probed is unavailable; only I/O errors (e.g. the
-    /// network) fail the whole listing.
-    fn list_volumes<R: Read + Seek + 'static>(
-        &self,
-        open_pv: impl Fn() -> R,
-        parent: &Path,
-    ) -> Result<Vec<Entry>> {
-        let mut entries = Vec::new();
-        for lv in self.lvm.lvs().filter(is_visible) {
-            let name = self.name(lv);
-            let path = parent.join(&name);
-            let probed = self
-                .reader(lv, open_pv(), &path)
-                .and_then(|mut reader| filesystem(&mut reader));
-            let kind = match probed {
-                Ok(FsKind::Ext) => EntryKind::Partition,
-                Ok(other) => EntryKind::Unavailable {
-                    reason: reason(other).to_owned(),
-                },
-                Err(Error::UnsupportedFilesystem(reason) | Error::Image(reason)) => {
-                    EntryKind::Unavailable { reason }
-                }
-                Err(err) => return Err(err),
-            };
-            entries.push(Entry {
-                path,
-                name,
-                kind,
-                size: lv.size_in_extents().saturating_mul(self.lvm.extent_size()),
-                mtime: i64::try_from(lv.raw_metadata().creation_time)
-                    .ok()
-                    .filter(|&seconds| seconds > 0)
-                    .and_then(|seconds| Timestamp::from_second(seconds).ok()),
-                inside_image: true,
-            });
-        }
-        Ok(entries)
-    }
-
-    /// The visible logical volume named by the first component of `path`, and the rest of it.
-    ///
-    /// `shown` is the virtual path of `path`, named when no such volume exists.
-    fn logical_volume<'p>(
-        &self,
-        path: &'p Path,
-        shown: &Path,
-    ) -> Result<Option<(LV<'_>, &'p Path)>> {
-        let mut components = path.components();
-        let first = loop {
-            match components.next() {
-                Some(Component::Normal(name)) => break name,
-                Some(_) => continue,
-                None => return Ok(None),
-            }
-        };
-        let lv = self
-            .lvm
-            .lvs()
-            .filter(is_visible)
-            .find(|lv| first.to_str() == Some(self.name(*lv).as_str()))
-            .ok_or_else(|| Error::NotFound(shown.to_path_buf()))?;
-        Ok(Some((lv, components.as_path())))
-    }
-
-    /// The name shown for `lv`: `<vg>-<lv>`, e.g. "vg0-root". Unlike the device mapper, hyphens
-    /// inside the names are not doubled (`my-vg` + `root` is "my-vg-root", not "my--vg-root").
-    fn name(&self, lv: LV<'_>) -> String {
-        format!("{}-{}", self.lvm.vg_name(), lv.name())
-    }
-
-    /// `lv` as reader over `pv`; `UnsupportedFilesystem` for types of logical volume that can't be read.
-    ///
-    /// `shown` is the virtual path to name in errors.
-    fn reader<R: Read + Seek>(&self, lv: LV<'_>, pv: R, shown: &Path) -> Result<LvReader<R>> {
-        match self.lvm.open_lv_owned_by_name(lv.name(), FromStd(pv)) {
-            Ok(Some(reader)) => Ok(ToStd(reader)),
-            Ok(None) => Err(Error::NotFound(shown.to_path_buf())),
-            Err(OpenLvError::Unsupported(detail)) => {
-                Err(Error::UnsupportedFilesystem(unsupported_volume(lv, detail)))
-            }
-            Err(err) => Err(Error::Image(format!("The LVM volume is damaged: {err:?}"))),
-        }
-    }
+        Err(err) => return Err(Error::Image(format!("The LVM volume is damaged: {err:?}"))),
+    };
+    let fs = filesystem(&mut reader)?;
+    let size = reader.seek(SeekFrom::End(0))?;
+    Ok((Shared::new(reader, size), fs))
 }
 
 fn open_error(err: lamlvm::Error) -> Error {
@@ -214,12 +136,6 @@ fn filesystem<R: Read + Seek>(volume: &mut R) -> Result<FsKind> {
         }
     }
     Ok(kind)
-}
-
-/// Why the filesystem on a logical volume can't be browsed.
-fn reason(fs: FsKind) -> &'static str {
-    fs.unsupported_reason()
-        .unwrap_or("Only ext2/3/4 filesystems can be browsed inside LVM volumes")
 }
 
 /// An I/O error that keeps the original for `embedded_io`, which only knows the kind.
@@ -312,15 +228,15 @@ mod tests {
     }
 
     #[test]
-    fn the_volume_is_shared_between_threads() {
-        // `Volume` lives in an `Arc` that worker threads share.
+    fn the_volumes_are_shared_between_threads() {
+        // They live in an `Arc` that worker threads share.
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<LvmVolume>();
+        assert_send_sync::<LogicalVolume>();
     }
 
     #[test]
     fn open_rejects_other_data() {
-        let result = LvmVolume::open(Cursor::new(vec![0; 4096]));
+        let result = logical_volumes(Cursor::new(vec![0; 4096]));
         assert!(matches!(result, Err(Error::Image(_))));
     }
 

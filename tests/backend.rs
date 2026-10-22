@@ -1307,9 +1307,8 @@ fn is_pattern(data: &[u8]) -> bool {
 
 /// Checks the files of `generate-ext.sh` in the volume at `volume`, which is the same for
 /// ext2, ext4 and the ext4 volume in LVM.
-fn check_ext_files(fixture: &Fixture, volume: &Path) {
-    let session = fixture.open();
-    let snapshot = fixture.snapshot(&session);
+fn check_ext_files(fixture: &Fixture, session: &Session, volume: &Path) {
+    let snapshot = fixture.snapshot(session);
 
     let root = session.list_dir(&snapshot, volume).unwrap();
     assert_eq!(
@@ -1396,7 +1395,11 @@ fn browses_and_opens_files_on_ext4() {
     let partitions = session.list_dir(&snapshot, Path::new(LINUX_IMAGE)).unwrap();
     assert_eq!(names(&partitions), ["Partition 1", "Partition 2 (LVM)"]);
     assert!(partitions.iter().all(|p| p.kind == EntryKind::Partition));
-    check_ext_files(&fixture, &Path::new(LINUX_IMAGE).join("Partition 1"));
+    check_ext_files(
+        &fixture,
+        &session,
+        &Path::new(LINUX_IMAGE).join("Partition 1"),
+    );
 }
 
 #[test]
@@ -1408,7 +1411,11 @@ fn browses_and_opens_files_on_ext2_without_partition_table() {
     let partitions = session.list_dir(&snapshot, Path::new(EXT2_IMAGE)).unwrap();
     assert_eq!(names(&partitions), ["Partition 1"]);
     assert_eq!(partitions[0].size, 4 * MIB as u64);
-    check_ext_files(&fixture, &Path::new(EXT2_IMAGE).join("Partition 1"));
+    check_ext_files(
+        &fixture,
+        &session,
+        &Path::new(EXT2_IMAGE).join("Partition 1"),
+    );
 }
 
 #[test]
@@ -1442,7 +1449,7 @@ fn browses_logical_volumes() {
     assert!(reason(&volumes[4]).starts_with("This kind of LVM volume can't be browsed yet"));
     assert_eq!(volumes[3].size, 8 * MIB as u64);
 
-    check_ext_files(&fixture, &pv.join("vg0-root"));
+    check_ext_files(&fixture, &session, &pv.join("vg0-root"));
 
     for name in ["vg0-pool0", "vg0-thin1", "vg0-wide", "vg0-swap"] {
         let result = session.list_dir(&snapshot, &pv.join(name));
@@ -1460,6 +1467,9 @@ fn browses_logical_volumes() {
     }
     let result = session.extract_file(&snapshot, &pv.join("vg0-root"), fixture.dir.path());
     assert!(matches!(result, Err(Error::NotAFile(_))), "{result:?}");
+    // Nothing on the way is encrypted.
+    let result = session.unlock_volume(&snapshot, &pv.join("vg0-root/docs"), "key");
+    assert!(matches!(result, Err(Error::Image(_))), "{result:?}");
 }
 
 #[test]
@@ -1772,4 +1782,230 @@ fn restores_from_unlocked_volumes_and_refuses_locked_ones() {
     let result = session.restore(&snapshot, &request(&[LUKS1]), |_| {});
     assert!(matches!(result, Err(Error::VolumeLocked(_))), "{result:?}");
     assert!(!target.join("Partition 3").exists());
+}
+
+// --- nested layers -----------------------------------------------------------
+
+/// `tests/fixtures/luks-lvm.img.zst` of `generate-lvm.sh`: a LUKS1 volume (passphrase "luks
+/// fixture") holding the LVM volume group vg1 with `root` (the ext4 fixture), `crypt` (the
+/// LUKS2 fixture, same passphrase, a FAT volume inside), `fat` (a FAT volume with
+/// `hello.txt`) and `swap` (zeros). `nested.img` is a GPT disk with it as partition 1,
+/// `nested.qcow2` the bare volume in a qcow2 container.
+const NESTED_IMAGE: &str = "/data/nested.img";
+const NESTED_QCOW2: &str = "/data/nested.qcow2";
+
+fn nested_fixture() -> Fixture {
+    let disk = gpt_disk(&[(volume_fixture("luks-lvm.img"), LINUX_TYPE)]);
+    with_files(&[
+        ("nested.img", disk),
+        ("nested.qcow2", container("nested.qcow2")),
+    ])
+}
+
+#[test]
+fn browses_lvm_and_its_filesystems_under_luks() {
+    let fixture = nested_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let partition = Path::new(NESTED_IMAGE).join("Partition 1");
+
+    let partitions = session
+        .list_dir(&snapshot, Path::new(NESTED_IMAGE))
+        .unwrap();
+    assert_eq!(names(&partitions), ["Partition 1"]);
+    assert_eq!(partitions[0].kind, EntryKind::Encrypted);
+    let result = session.list_dir(&snapshot, &partition.join("vg1-root/docs"));
+    assert!(
+        is_locked(&result, partition.to_str().unwrap()),
+        "{result:?}"
+    );
+
+    // Partition -> LUKS -> LVM: the logical volumes, each with its own kind.
+    session
+        .unlock_volume(&snapshot, &partition, LUKS_PASSPHRASE)
+        .unwrap();
+    let volumes = session.list_dir(&snapshot, &partition).unwrap();
+    assert_eq!(
+        names(&volumes),
+        ["vg1-crypt", "vg1-fat", "vg1-root", "vg1-swap"]
+    );
+    assert_eq!(volumes[0].kind, EntryKind::Encrypted);
+    assert_eq!(volumes[1].kind, EntryKind::Partition);
+    assert_eq!(volumes[2].kind, EntryKind::Partition);
+    assert_eq!(
+        volumes[3].kind,
+        EntryKind::Unavailable {
+            reason: "No supported filesystem".to_owned()
+        }
+    );
+    assert_eq!(volumes[0].size, 2 * MIB as u64);
+    assert_eq!(volumes[2].size, 4 * MIB as u64);
+    assert!(volumes.iter().all(|v| v.inside_image));
+
+    // -> ext4, with everything the plain ext4 volume offers.
+    check_ext_files(&fixture, &session, &partition.join("vg1-root"));
+
+    // -> FAT inside a logical volume.
+    let fat = partition.join("vg1-fat");
+    assert_eq!(
+        names(&session.list_dir(&snapshot, &fat).unwrap()),
+        ["hello.txt"]
+    );
+    let hello = session
+        .extract_file(&snapshot, &fat.join("hello.txt"), fixture.dir.path())
+        .unwrap();
+    assert_eq!(fs::read(hello).unwrap(), b"hello lvm fat\n");
+
+    // -> LUKS inside a logical volume: locked on its own, named by its own path.
+    let crypt = partition.join("vg1-crypt");
+    let result = session.list_dir(&snapshot, &crypt.join("docs"));
+    assert!(is_locked(&result, crypt.to_str().unwrap()), "{result:?}");
+    let result = session.unlock_volume(&snapshot, &crypt, "nope");
+    assert!(matches!(result, Err(Error::WrongPassword)), "{result:?}");
+    assert!(is_locked(
+        &session.list_dir(&snapshot, &crypt),
+        crypt.to_str().unwrap()
+    ));
+    session
+        .unlock_volume(&snapshot, &crypt.join("docs"), LUKS_PASSPHRASE)
+        .unwrap();
+    assert_eq!(
+        names(&session.list_dir(&snapshot, &crypt).unwrap()),
+        ["docs", "hello.txt", "pattern.bin"]
+    );
+    let deep = session
+        .extract_file(
+            &snapshot,
+            &crypt.join("docs/sub/deep.txt"),
+            fixture.dir.path(),
+        )
+        .unwrap();
+    assert_eq!(fs::read(deep).unwrap(), b"deep\n");
+
+    // A path inside the partition means the partition: unlocked again, nothing is lost.
+    session
+        .unlock_volume(&snapshot, &fat, LUKS_PASSPHRASE)
+        .unwrap();
+    assert_eq!(
+        names(&session.list_dir(&snapshot, &crypt).unwrap()),
+        ["docs", "hello.txt", "pattern.bin"]
+    );
+
+    // Both keys are kept for the session: a new image with the same volumes opens at once.
+    let other = fixture.open();
+    let result = other.list_dir(&fixture.snapshot(&other), &crypt);
+    assert!(
+        is_locked(&result, partition.to_str().unwrap()),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn restores_through_nested_layers() {
+    let fixture = nested_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let partition = Path::new(NESTED_IMAGE).join("Partition 1");
+    let request = |item: PathBuf, target: PathBuf| RestoreRequest {
+        items: vec![item],
+        target,
+    };
+
+    // The whole partition while a volume inside is still locked: nothing is written.
+    session
+        .unlock_volume(&snapshot, &partition, LUKS_PASSPHRASE)
+        .unwrap();
+    let target = fixture.folder("locked");
+    let result = session.restore(
+        &snapshot,
+        &request(partition.clone(), target.clone()),
+        |_| {},
+    );
+    assert!(matches!(result, Err(Error::VolumeLocked(_))), "{result:?}");
+    assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+
+    let target = fixture.folder("docs");
+    let summary = session
+        .restore(
+            &snapshot,
+            &request(partition.join("vg1-root/docs"), target.clone()),
+            |_| {},
+        )
+        .unwrap();
+    assert_eq!(summary.skipped, 0);
+    assert_eq!(
+        fs::read_to_string(target.join("docs/sub/deep.txt")).unwrap(),
+        "deep\n"
+    );
+
+    // Everything unlocked: the whole partition, the ext link and the swap volume left out.
+    session
+        .unlock_volume(&snapshot, &partition.join("vg1-crypt"), LUKS_PASSPHRASE)
+        .unwrap();
+    let target = fixture.folder("all");
+    let preview = session
+        .preview_restore(&snapshot, &request(partition.clone(), target.clone()))
+        .unwrap();
+    assert_eq!(preview.conflicts, 0);
+    let summary = session
+        .restore(
+            &snapshot,
+            &request(partition.clone(), target.clone()),
+            |_| {},
+        )
+        .unwrap();
+    assert_eq!(summary.skipped, 2);
+    let root = target.join("Partition 1");
+    assert!(is_pattern(
+        &fs::read(root.join("vg1-root/big.bin")).unwrap()
+    ));
+    assert_eq!(
+        fs::read(root.join("vg1-crypt/pattern.bin")).unwrap().len(),
+        20_000
+    );
+    assert_eq!(
+        fs::read(root.join("vg1-fat/hello.txt")).unwrap(),
+        b"hello lvm fat\n"
+    );
+    assert!(!root.join("vg1-swap").exists());
+}
+
+#[test]
+fn browses_nested_layers_inside_a_qcow2_container() {
+    let fixture = nested_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let partition = Path::new(NESTED_QCOW2).join("Partition 1");
+
+    let partitions = session
+        .list_dir(&snapshot, Path::new(NESTED_QCOW2))
+        .unwrap();
+    assert_eq!(names(&partitions), ["Partition 1"]);
+    assert_eq!(partitions[0].kind, EntryKind::Encrypted);
+    assert!(is_locked(
+        &session.list_dir(&snapshot, &partition),
+        partition.to_str().unwrap()
+    ));
+    session
+        .unlock_volume(&snapshot, &partition, LUKS_PASSPHRASE)
+        .unwrap();
+    assert_eq!(
+        names(&session.list_dir(&snapshot, &partition).unwrap()),
+        ["vg1-crypt", "vg1-fat", "vg1-root", "vg1-swap"]
+    );
+    check_ext_files(&fixture, &session, &partition.join("vg1-root"));
+
+    // The same volume as in the raw image, so its key is known already.
+    session
+        .unlock_volume(
+            &snapshot,
+            &Path::new(NESTED_IMAGE).join("Partition 1/vg1-crypt"),
+            LUKS_PASSPHRASE,
+        )
+        .unwrap();
+    let crypt = partition.join("vg1-crypt");
+    assert_eq!(
+        names(&session.list_dir(&snapshot, &crypt).unwrap()),
+        ["docs", "hello.txt", "pattern.bin"]
+    );
 }

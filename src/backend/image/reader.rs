@@ -2,7 +2,7 @@
 
 use std::{
     io::{self, Read, Seek, SeekFrom, Write},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use rustic_core::{repofile::Node, vfs::OpenFile};
@@ -94,6 +94,64 @@ impl<R: Read + Seek> Read for Slice<R> {
 impl<R: Read + Seek> Seek for Slice<R> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         self.pos = seek_position(self.pos, self.len, pos)?;
+        Ok(self.pos)
+    }
+}
+
+trait Inner: Read + Seek + Send {}
+impl<T: Read + Seek + Send> Inner for T {}
+
+/// A reader that can't be cloned, made shareable: the plaintext of an encrypted volume or a
+/// logical volume.
+///
+/// The reader sits behind a lock, clones share it but keep their own position, like clones
+/// of a [`SnapshotReader`].
+#[derive(Clone)]
+pub struct Shared {
+    source: Arc<Mutex<Box<dyn Inner>>>,
+    size: u64,
+    pos: u64,
+}
+
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shared")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Shared {
+    pub fn new(source: impl Read + Seek + Send + 'static, size: u64) -> Self {
+        Self {
+            source: Arc::new(Mutex::new(Box::new(source))),
+            size,
+            pos: 0,
+        }
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+impl Read for Shared {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let len = buf.len().min(self.size.saturating_sub(self.pos) as usize);
+        if len == 0 {
+            return Ok(0);
+        }
+        let mut source = self.source.lock().unwrap();
+        source.seek(SeekFrom::Start(self.pos))?;
+        let n = source.read(&mut buf[..len])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for Shared {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.pos = seek_position(self.pos, self.size, pos)?;
         Ok(self.pos)
     }
 }

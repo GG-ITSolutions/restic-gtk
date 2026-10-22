@@ -1,20 +1,17 @@
 //! Encrypted volumes: BitLocker and LUKS, unlocked into a plain `Read + Seek` source.
 //!
 //! The decryption is done by the `bitlocker-core` and `luks-core` crates. This module only
-//! makes their readers clonable like a [`Slice`](super::reader::Slice) and turns their errors
-//! into [`Error`]s, so that the crates can be replaced without touching anything else. What the
-//! plaintext holds (NTFS, FAT, later ext4 or LVM) is for the caller to detect.
+//! makes their readers clonable as a [`Shared`] and turns their errors into [`Error`]s, so that
+//! the crates can be replaced without touching anything else. What the plaintext holds (a
+//! filesystem, LVM) is for the caller to detect.
 
-use std::{
-    io::{self, Read, Seek, SeekFrom},
-    sync::{Arc, Mutex},
-};
+use std::io::{Read, Seek, SeekFrom};
 
 use bitlocker::{BdeError, BitLockerVolume};
 use luks::{LuksError, LuksVolume};
 use zeroize::Zeroizing;
 
-use super::{partition::FsKind, wof::seek_position};
+use super::{partition::FsKind, reader::Shared};
 use crate::backend::{Error, Result};
 
 /// Tells an encrypted volume apart across snapshots: the BitLocker volume GUID or the LUKS UUID.
@@ -26,67 +23,6 @@ pub(super) type Secret = Zeroizing<String>;
 /// Offset and length of the UUID in the header of LUKS1 and LUKS2.
 const LUKS_UUID: std::ops::Range<usize> = 168..208;
 
-trait Plaintext: Read + Seek + Send {}
-impl<T: Read + Seek + Send> Plaintext for T {}
-
-/// The plaintext of an unlocked volume.
-///
-/// The decrypting readers of the crates need `&mut self` for everything, so they sit behind a
-/// lock. Clones share it, but keep their own position, like clones of a `SnapshotReader`.
-#[derive(Clone)]
-pub(super) struct Decrypted {
-    source: Arc<Mutex<Box<dyn Plaintext>>>,
-    size: u64,
-    pos: u64,
-}
-
-impl std::fmt::Debug for Decrypted {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Decrypted")
-            .field("size", &self.size)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Decrypted {
-    fn new(source: impl Read + Seek + Send + 'static, size: u64) -> Self {
-        Self {
-            source: Arc::new(Mutex::new(Box::new(source))),
-            size,
-            pos: 0,
-        }
-    }
-
-    /// Another reader of the same plaintext, positioned at the start.
-    pub fn rewound(&self) -> Self {
-        Self {
-            pos: 0,
-            ..self.clone()
-        }
-    }
-}
-
-impl Read for Decrypted {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let len = buf.len().min(self.size.saturating_sub(self.pos) as usize);
-        if len == 0 {
-            return Ok(0);
-        }
-        let mut source = self.source.lock().unwrap();
-        source.seek(SeekFrom::Start(self.pos))?;
-        let n = source.read(&mut buf[..len])?;
-        self.pos += n as u64;
-        Ok(n)
-    }
-}
-
-impl Seek for Decrypted {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.pos = seek_position(self.pos, self.size, pos)?;
-        Ok(self.pos)
-    }
-}
-
 /// Unlocks the encrypted volume `raw` of the kind `kind` (`BitLocker` or `Luks`).
 ///
 /// For BitLocker, a 48 digit number is tried as recovery password first, then as password of the
@@ -94,7 +30,7 @@ impl Seek for Decrypted {
 /// password protector at all); anything else only as password.
 /// Key derivation takes from 0.1 s (BitLocker) to several seconds (LUKS2 with Argon2), so call
 /// this off the main thread.
-pub(super) fn unlock<R>(kind: FsKind, raw: R, secret: &str) -> Result<Decrypted>
+pub(super) fn unlock<R>(kind: FsKind, raw: R, secret: &str) -> Result<Shared>
 where
     R: Read + Seek + Send + Clone + 'static,
 {
@@ -117,13 +53,13 @@ where
                 None => with_password(raw),
             }?;
             let size = volume.volume_size();
-            Ok(Decrypted::new(volume, size))
+            Ok(Shared::new(volume, size))
         }
         FsKind::Luks => {
             let volume =
                 LuksVolume::unlock_with_passphrase(raw, secret.as_bytes()).map_err(luks_error)?;
             let size = volume.payload_size();
-            Ok(Decrypted::new(volume, size))
+            Ok(Shared::new(volume, size))
         }
         other => Err(Error::Image(format!(
             "{other:?} is not an encrypted volume"
@@ -271,7 +207,7 @@ mod tests {
     }
 
     /// The FAT volume inside: boot sector signature and its first file.
-    fn assert_fat_volume(plain: &mut Decrypted) {
+    fn assert_fat_volume(plain: &mut Shared) {
         assert_eq!(detect_fs(plain, 0).unwrap(), FsKind::Fat);
         let mut boot = [0; 512];
         plain.seek(SeekFrom::Start(0)).unwrap();
@@ -289,7 +225,7 @@ mod tests {
             "013574624679047531660000008547345565299002046662",
         ] {
             let mut plain = unlock(FsKind::BitLocker, fixture("bitlocker"), secret).unwrap();
-            assert_eq!(plain.size, 1 << 20, "{secret}");
+            assert_eq!(plain.size(), 1 << 20, "{secret}");
             assert_fat_volume(&mut plain);
         }
     }
@@ -299,7 +235,7 @@ mod tests {
         // The payload is what is left after the header: 2 MiB of the 4 MiB, 1 MiB of 1.25 MiB.
         for (name, size) in [("luks1", 2 << 20), ("luks2", 1 << 20)] {
             let mut plain = unlock(FsKind::Luks, fixture(name), LUKS_PASSPHRASE).unwrap();
-            assert_eq!(plain.size, size, "{name}");
+            assert_eq!(plain.size(), size, "{name}");
             assert_fat_volume(&mut plain);
         }
     }
@@ -347,7 +283,7 @@ mod tests {
     fn clones_keep_their_own_position() {
         let mut first = unlock(FsKind::Luks, fixture("luks2"), LUKS_PASSPHRASE).unwrap();
         first.seek(SeekFrom::Start(510)).unwrap();
-        let mut second = first.rewound();
+        let mut second = first.clone();
         let (mut a, mut b) = ([0; 2], [0; 2]);
         first.read_exact(&mut a).unwrap();
         second.seek(SeekFrom::Start(0)).unwrap();

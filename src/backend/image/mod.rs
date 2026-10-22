@@ -3,6 +3,13 @@
 //! A path inside an image continues the path of the image file in the snapshot:
 //! `/disk0.img/Partition 3 (C:)/Users`. The first level below the image are its
 //! partitions, below that the files of the filesystem.
+//!
+//! Between the two there may be more layers: an LVM physical volume is a folder of its
+//! logical volumes (`/disk0.img/Partition 2 (LVM)/vg0-root/etc`), and an encrypted volume
+//! is browsed like a plain one once it is unlocked. Every layer is a [`Layer`], opened the
+//! same way whatever lies above it: read the first sectors, detect what is there, dispatch.
+//! So ext4 under LUKS, LUKS inside a logical volume or LVM inside BitLocker all work, also
+//! inside a qcow2 or VHDX container, which sits below the partition table.
 
 mod container;
 mod crypt;
@@ -27,17 +34,16 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use rustic_core::repofile::Node;
+use rustic_core::{jiff::Timestamp, repofile::Node};
 
 use self::{
     container::Disk,
-    crypt::{Decrypted, Secret, VolumeId},
+    crypt::{Secret, VolumeId},
     ext::ExtVolume,
     fat::FatVolume,
-    lvm::LvmVolume,
     ntfs::NtfsVolume,
     partition::{FsKind, Partition},
-    reader::Slice,
+    reader::{Shared, Slice},
 };
 use super::{Entry, EntryKind, Error, Result, session::IndexedRepo};
 
@@ -106,38 +112,54 @@ impl ImageRef<'_> {
 
 struct OpenImage {
     key: (String, PathBuf),
-    reader: ImageReader,
-    partitions: Vec<OpenPartition>,
+    partitions: Vec<Arc<Layer>>,
 }
 
-struct OpenPartition {
-    info: Partition,
-    /// Drive letter from `system.json`, e.g. 'C'.
-    drive: Option<char>,
-    /// Opened on first use; errors aren't kept, they may be passing network trouble.
-    volume: Mutex<Option<Arc<Volume>>>,
-    /// Encrypted partitions: what they decrypt to, once unlocked.
-    unlocked: Mutex<Option<Decrypted>>,
+/// A block device inside an image and what was found on it: a partition, a logical volume or
+/// the plaintext of an encrypted volume.
+struct Layer {
+    /// The folder name, e.g. "Partition 3 (C:)" or "vg0-root"; empty for a plaintext.
+    name: String,
+    /// Partitions are found by their number (the rest of the name may be left out), the other
+    /// layers by their name.
+    number: Option<u32>,
+    size: u64,
+    mtime: Option<Timestamp>,
+    /// The bytes and the kind of filesystem at their start, or why there is nothing to read.
+    block: std::result::Result<(Source, FsKind), String>,
+    /// What is on the layer, opened on first use; errors aren't kept, they may be passing
+    /// network trouble.
+    opened: Mutex<Option<Opened>>,
+    /// Encrypted volumes: the plaintext as a layer of its own, once unlocked.
+    plain: Mutex<Option<Arc<Layer>>>,
 }
 
-enum Volume {
+/// What is on a layer.
+#[derive(Clone)]
+enum Opened {
+    Filesystem(Arc<Filesystem>),
+    /// The logical volumes of an LVM physical volume.
+    Volumes(Vec<Arc<Layer>>),
+}
+
+enum Filesystem {
     Ntfs(NtfsVolume),
     Fat,
     Ext,
-    Lvm(LvmVolume),
 }
 
-/// The bytes of a filesystem: a partition of the image, or what an encrypted one decrypts to.
+/// The bytes of a layer: a part of the image, or a reader on top of another layer.
+#[derive(Clone)]
 enum Source {
     Raw(Slice<ImageReader>),
-    Decrypted(Decrypted),
+    Shared(Shared),
 }
 
 impl Read for Source {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Raw(slice) => slice.read(buf),
-            Self::Decrypted(plain) => plain.read(buf),
+            Self::Shared(shared) => shared.read(buf),
         }
     }
 }
@@ -146,110 +168,209 @@ impl Seek for Source {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match self {
             Self::Raw(slice) => slice.seek(pos),
-            Self::Decrypted(plain) => plain.seek(pos),
+            Self::Shared(shared) => shared.seek(pos),
         }
     }
 }
 
-impl OpenPartition {
-    /// The folder name of the partition, e.g. "Partition 3 (C:)".
-    fn name(&self) -> String {
-        let number = self.info.number;
-        let role = self
-            .info
-            .role
-            .or((self.info.fs == FsKind::Lvm).then_some("LVM"));
-        match (self.drive, role) {
-            (Some(drive), _) => format!("{PARTITION_PREFIX}{number} ({drive}:)"),
-            (None, Some(role)) => format!("{PARTITION_PREFIX}{number} ({role})"),
-            (None, None) => format!("{PARTITION_PREFIX}{number}"),
+/// What a path inside an image names.
+enum Found<'p> {
+    /// A folder of layers: the partitions of the image, or the logical volumes of a group.
+    Layers(Vec<Arc<Layer>>),
+    /// A path inside a filesystem.
+    Inside {
+        fs: Arc<Filesystem>,
+        source: Source,
+        rest: &'p Path,
+    },
+}
+
+impl Layer {
+    fn new(
+        name: String,
+        number: Option<u32>,
+        size: u64,
+        mtime: Option<Timestamp>,
+        block: std::result::Result<(Source, FsKind), String>,
+    ) -> Self {
+        Self {
+            name,
+            number,
+            size,
+            mtime,
+            block,
+            opened: Mutex::new(None),
+            plain: Mutex::new(None),
         }
     }
 
-    /// The partition as it is on disk.
-    fn raw(&self, image: &ImageReader) -> Slice<ImageReader> {
-        Slice::new(image.clone(), self.info.start, self.info.len)
-    }
-
-    /// The bytes of the filesystem: the partition, or for an unlocked encrypted one its plaintext.
-    fn slice(&self, image: &ImageReader) -> Source {
-        match &*self.unlocked.lock().unwrap() {
-            Some(plain) => Source::Decrypted(plain.rewound()),
-            None => Source::Raw(self.raw(image)),
+    /// The encrypted volume `fs` on `source`, if that is one.
+    fn encrypted(&self) -> Option<(&Source, FsKind)> {
+        match &self.block {
+            Ok((source, fs)) if fs.is_encrypted() => Some((source, *fs)),
+            _ => None,
         }
     }
 
-    /// The filesystem of the partition; `None` if it is encrypted and no key for it is known.
-    fn volume(&self, image: &ImageReader, keys: &KeyCache) -> Result<Option<Arc<Volume>>> {
-        let mut volume = self.volume.lock().unwrap();
-        if let Some(volume) = volume.as_ref() {
-            return Ok(Some(volume.clone()));
+    /// The entry of the layer in the folder `parent`.
+    fn entry(&self, parent: &Path) -> Entry {
+        Entry {
+            path: parent.join(&self.name),
+            name: self.name.clone(),
+            kind: match &self.block {
+                Err(reason) => EntryKind::Unavailable {
+                    reason: reason.clone(),
+                },
+                Ok((_, fs)) if fs.is_encrypted() => EntryKind::Encrypted,
+                Ok((_, fs)) => match fs.unsupported_reason() {
+                    None => EntryKind::Partition,
+                    Some(reason) => EntryKind::Unavailable {
+                        reason: reason.to_owned(),
+                    },
+                },
+            },
+            size: self.size,
+            mtime: self.mtime,
+            inside_image: true,
         }
-        let fs = if self.info.fs.is_encrypted() {
-            if !self.is_unlocked(image, keys)? {
-                return Ok(None);
+    }
+
+    /// Whether the path component `name` means this layer.
+    fn is_named(&self, name: &OsStr) -> bool {
+        match self.number {
+            Some(number) => {
+                name.to_str()
+                    .and_then(|name| name.strip_prefix(PARTITION_PREFIX))
+                    .map(|rest| rest.split(' ').next().unwrap_or_default())
+                    .and_then(|number| number.parse::<u32>().ok())
+                    == Some(number)
             }
-            // The plaintext can hold anything a partition can.
-            partition::detect_fs(&mut self.slice(image), 0)?
-        } else {
-            self.info.fs
+            None => name == OsStr::new(&self.name),
+        }
+    }
+
+    /// What is on the layer and the bytes to read it from; an encrypted layer answers for its
+    /// plaintext. `path` is the virtual path of the layer, named in errors.
+    ///
+    /// Fails with [`Error::VolumeLocked`] if the layer is encrypted and the session doesn't
+    /// know its key.
+    fn open(&self, keys: &KeyCache, path: &Path) -> Result<(Opened, Source)> {
+        let (source, fs) = match &self.block {
+            Ok((source, fs)) => (source, *fs),
+            Err(reason) => return Err(Error::UnsupportedFilesystem(reason.clone())),
         };
-        let opened = Arc::new(match fs {
-            FsKind::Ntfs => Volume::Ntfs(NtfsVolume::open(&mut self.slice(image))?),
-            FsKind::Fat => Volume::Fat,
-            FsKind::Ext => Volume::Ext,
-            FsKind::Lvm => Volume::Lvm(LvmVolume::open(self.slice(image))?),
+        if fs.is_encrypted() {
+            return self.unlocked(keys, path)?.open(keys, path);
+        }
+        let mut opened = self.opened.lock().unwrap();
+        if let Some(opened) = opened.as_ref() {
+            return Ok((opened.clone(), source.clone()));
+        }
+        let found = match fs {
+            FsKind::Ntfs => Opened::Filesystem(Arc::new(Filesystem::Ntfs(NtfsVolume::open(
+                &mut source.clone(),
+            )?))),
+            FsKind::Fat => Opened::Filesystem(Arc::new(Filesystem::Fat)),
+            FsKind::Ext => Opened::Filesystem(Arc::new(Filesystem::Ext)),
+            FsKind::Lvm => Opened::Volumes(
+                lvm::logical_volumes(source.clone())?
+                    .into_iter()
+                    .map(|lv| {
+                        let block = lv.content.map(|(reader, fs)| (Source::Shared(reader), fs));
+                        Arc::new(Layer::new(lv.name, None, lv.size, lv.mtime, block))
+                    })
+                    .collect(),
+            ),
             other => {
                 return Err(Error::UnsupportedFilesystem(
                     other.unsupported_reason().unwrap_or_default().to_owned(),
                 ));
             }
-        });
-        *volume = Some(opened.clone());
-        Ok(Some(opened))
+        };
+        *opened = Some(found.clone());
+        Ok((found, source.clone()))
     }
 
-    /// Whether the encrypted partition is unlocked, unlocking it first if the session knows its key.
-    fn is_unlocked(&self, image: &ImageReader, keys: &KeyCache) -> Result<bool> {
-        if self.unlocked.lock().unwrap().is_some() {
-            return Ok(true);
+    /// The plaintext of the encrypted layer, unlocking it first if the session knows its key.
+    fn unlocked(&self, keys: &KeyCache, path: &Path) -> Result<Arc<Layer>> {
+        if let Some(plain) = self.plain.lock().unwrap().as_ref() {
+            return Ok(plain.clone());
         }
-        let id = crypt::volume_id(self.info.fs, &mut self.raw(image))?;
+        let (source, fs) = self.encrypted().expect("checked by the caller");
+        let id = crypt::volume_id(fs, &mut source.clone())?;
         let Some(secret) = keys.lock().unwrap().get(&id).cloned() else {
-            return Ok(false);
+            return Err(Error::VolumeLocked(path.to_path_buf()));
         };
-        match crypt::unlock(self.info.fs, self.raw(image), &secret) {
-            Ok(plain) => {
-                *self.unlocked.lock().unwrap() = Some(plain);
-                Ok(true)
-            }
+        match self.decrypt(source, fs, &secret) {
             // Not the key of this volume any more, e.g. it was encrypted anew: ask again.
             Err(Error::WrongPassword) => {
                 keys.lock().unwrap().remove(&id);
-                Ok(false)
+                Err(Error::VolumeLocked(path.to_path_buf()))
             }
-            Err(err) => Err(err),
+            plain => plain,
         }
     }
 
-    /// Unlocks the encrypted partition with `secret` and remembers it for the session.
-    fn unlock(&self, image: &ImageReader, secret: &str, keys: &KeyCache) -> Result<()> {
-        if !self.info.fs.is_encrypted() {
-            return Err(Error::Image(format!("“{}” is not encrypted", self.name())));
-        }
-        let plain = crypt::unlock(self.info.fs, self.raw(image), secret)?;
-        let id = crypt::volume_id(self.info.fs, &mut self.raw(image))?;
-        {
-            // Same order as in `volume()`. A filesystem opened before is dropped, it was read
-            // from the other source.
-            let mut volume = self.volume.lock().unwrap();
-            *self.unlocked.lock().unwrap() = Some(plain);
-            *volume = None;
-        }
+    /// Unlocks the encrypted layer with `secret` and remembers it for the session.
+    fn unlock(&self, secret: &str, keys: &KeyCache, path: &Path) -> Result<()> {
+        let Some((source, fs)) = self.encrypted() else {
+            return Err(Error::Image(format!(
+                "“{}” is not encrypted",
+                path.display()
+            )));
+        };
+        self.decrypt(source, fs, secret)?;
+        let id = crypt::volume_id(fs, &mut source.clone())?;
         keys.lock()
             .unwrap()
             .insert(id, Secret::new(secret.to_owned()));
         Ok(())
+    }
+
+    /// Decrypts the layer with `secret` and keeps the plaintext as a layer; whatever an earlier
+    /// unlock opened is dropped.
+    fn decrypt(&self, source: &Source, fs: FsKind, secret: &str) -> Result<Arc<Layer>> {
+        let plain = crypt::unlock(fs, source.clone(), secret)?;
+        let size = plain.size();
+        let mut plain = Source::Shared(plain);
+        // The plaintext can hold anything a partition can. Filesystem libraries expect a
+        // source at its start, and clones keep the position.
+        let fs = partition::detect_fs(&mut plain, 0)?;
+        plain.seek(SeekFrom::Start(0))?;
+        let block = if fs.is_encrypted() {
+            Err("Encrypted volumes inside encrypted volumes can't be browsed".to_owned())
+        } else {
+            Ok((plain, fs))
+        };
+        let layer = Arc::new(Layer::new(String::new(), None, size, None, block));
+        *self.plain.lock().unwrap() = Some(layer.clone());
+        Ok(layer)
+    }
+}
+
+impl Filesystem {
+    /// The entries of the folder at `path`, named below the virtual path `parent`.
+    fn list(&self, mut source: Source, path: &Path, parent: &Path) -> Result<Vec<Entry>> {
+        match self {
+            Self::Ntfs(volume) => volume.list(&mut source, path, parent),
+            Self::Fat => FatVolume::list(source, path, parent),
+            Self::Ext => ExtVolume::list(source, path, parent),
+        }
+    }
+
+    /// Writes the file at `path`, shown as `shown` in errors, to `out`.
+    fn write_file(
+        &self,
+        mut source: Source,
+        path: &Path,
+        shown: &Path,
+        out: &mut dyn Write,
+    ) -> Result<()> {
+        match self {
+            Self::Ntfs(volume) => volume.write_file(&mut source, path, shown, out),
+            Self::Fat => FatVolume::write_file(source, path, shown, out),
+            Self::Ext => ExtVolume::write_file(source, path, shown, out),
+        }
     }
 }
 
@@ -258,22 +379,9 @@ impl ImageCache {
     pub fn list(&self, image: &ImageRef, inner: &Path) -> Result<Vec<Entry>> {
         let open = self.open(image)?;
         let virtual_path = image.path.join(inner);
-        let Some((partition, rest)) = open.partition(inner)? else {
-            return Ok(open
-                .partitions
-                .iter()
-                .map(|p| partition_entry(p, image.path))
-                .collect());
-        };
-        match &*open.volume(partition, &self.keys)? {
-            Volume::Ntfs(volume) => {
-                volume.list(&mut partition.slice(&open.reader), rest, &virtual_path)
-            }
-            Volume::Fat => FatVolume::list(partition.slice(&open.reader), rest, &virtual_path),
-            Volume::Ext => ExtVolume::list(partition.slice(&open.reader), rest, &virtual_path),
-            Volume::Lvm(volume) => {
-                volume.list(|| partition.slice(&open.reader), rest, &virtual_path)
-            }
+        match open.find(inner, &self.keys)? {
+            Found::Layers(layers) => Ok(layers.iter().map(|l| l.entry(&virtual_path)).collect()),
+            Found::Inside { fs, source, rest } => fs.list(source, rest, &virtual_path),
         }
     }
 
@@ -281,31 +389,22 @@ impl ImageCache {
     pub fn write_file(&self, image: &ImageRef, inner: &Path, out: &mut dyn Write) -> Result<()> {
         let open = self.open(image)?;
         let shown = image.path.join(inner);
-        let (partition, rest) = open
-            .partition(inner)?
-            .ok_or_else(|| Error::NotAFile(shown.clone()))?;
-        match &*open.volume(partition, &self.keys)? {
-            Volume::Ntfs(volume) => {
-                volume.write_file(&mut partition.slice(&open.reader), rest, &shown, out)
-            }
-            Volume::Fat => FatVolume::write_file(partition.slice(&open.reader), rest, &shown, out),
-            Volume::Ext => ExtVolume::write_file(partition.slice(&open.reader), rest, &shown, out),
-            Volume::Lvm(volume) => {
-                volume.write_file(|| partition.slice(&open.reader), rest, &shown, out)
-            }
+        match open.find(inner, &self.keys)? {
+            Found::Layers(_) => Err(Error::NotAFile(shown)),
+            Found::Inside { fs, source, rest } => fs.write_file(source, rest, &shown, out),
         }
     }
 
-    /// Unlocks the encrypted partition that `inner` is or lies in, with a recovery password or
+    /// Unlocks the encrypted volume that `inner` is or lies in, with a recovery password or
     /// passphrase, and remembers it for the session.
     ///
+    /// Of nested encrypted volumes, the deepest one on the way to `inner` that can be reached
+    /// is meant: the locked one, which is the one an [`Error::VolumeLocked`] named.
     /// Fails with [`Error::WrongPassword`] if the secret doesn't fit the volume.
     pub fn unlock(&self, image: &ImageRef, inner: &Path, secret: &str) -> Result<()> {
         let open = self.open(image)?;
-        let (partition, _) = open
-            .partition(inner)?
-            .ok_or_else(|| Error::NotFound(image.path.join(inner)))?;
-        partition.unlock(&open.reader, secret, &self.keys)
+        let (layer, path) = open.encrypted(inner, &self.keys)?;
+        layer.unlock(secret, &self.keys, &path)
     }
 
     /// The opened image, reading its partition table if it isn't open yet.
@@ -340,18 +439,19 @@ impl ImageCache {
             .unwrap_or_default();
         let partitions = table
             .into_iter()
-            .map(|info| OpenPartition {
-                drive: drives.iter().find(|d| d.0 == info.start).map(|d| d.1),
-                info,
-                volume: Mutex::new(None),
-                unlocked: Mutex::new(None),
+            .map(|info| {
+                let drive = drives.iter().find(|d| d.0 == info.start).map(|d| d.1);
+                let slice = Slice::new(reader.clone(), info.start, info.len);
+                Arc::new(Layer::new(
+                    partition_name(&info, drive),
+                    Some(info.number),
+                    info.len,
+                    None,
+                    Ok((Source::Raw(slice), info.fs)),
+                ))
             })
             .collect();
-        let open = Arc::new(OpenImage {
-            key,
-            reader,
-            partitions,
-        });
+        let open = Arc::new(OpenImage { key, partitions });
 
         let mut images = self.images.lock().unwrap();
         images.retain(|i| i.key != open.key);
@@ -364,55 +464,91 @@ impl ImageCache {
 }
 
 impl OpenImage {
-    /// The filesystem of `partition`; fails with [`Error::VolumeLocked`] if it is encrypted and
-    /// the session doesn't know its key.
-    fn volume(&self, partition: &OpenPartition, keys: &KeyCache) -> Result<Arc<Volume>> {
-        partition
-            .volume(&self.reader, keys)?
-            .ok_or_else(|| Error::VolumeLocked(self.key.1.join(partition.name())))
+    /// Follows `inner` down the layers, to a filesystem or to a folder of layers.
+    fn find<'p>(&self, inner: &'p Path, keys: &KeyCache) -> Result<Found<'p>> {
+        let mut layers = self.partitions.clone();
+        let mut path = self.key.1.clone();
+        let mut components = inner.components();
+        loop {
+            let name = loop {
+                match components.next() {
+                    Some(Component::Normal(name)) => break name,
+                    Some(_) => continue,
+                    None => return Ok(Found::Layers(layers)),
+                }
+            };
+            let layer = child(&layers, name, &path)?;
+            path.push(&layer.name);
+            match layer.open(keys, &path)? {
+                (Opened::Volumes(volumes), _) => layers = volumes,
+                (Opened::Filesystem(fs), source) => {
+                    return Ok(Found::Inside {
+                        fs,
+                        source,
+                        rest: components.as_path(),
+                    });
+                }
+            }
+        }
     }
 
-    /// The partition named by the first component of `inner`, and the rest of the path.
-    fn partition<'p>(&self, inner: &'p Path) -> Result<Option<(&OpenPartition, &'p Path)>> {
-        let mut components = inner.components();
-        let first = loop {
-            match components.next() {
-                Some(Component::Normal(name)) => break name,
-                Some(_) => continue,
-                None => return Ok(None),
+    /// The encrypted layer that `inner` is or lies in, with its virtual path: the deepest one on
+    /// the way that can be reached, so a locked one or the last one before the filesystem.
+    fn encrypted(&self, inner: &Path, keys: &KeyCache) -> Result<(Arc<Layer>, PathBuf)> {
+        let mut layers = self.partitions.clone();
+        let mut path = self.key.1.clone();
+        let mut found = None;
+        let names: Vec<&OsStr> = inner
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        if names.is_empty() {
+            return Err(Error::NotFound(path));
+        }
+        for (index, name) in names.iter().enumerate() {
+            let layer = child(&layers, name, &path)?;
+            path.push(&layer.name);
+            if layer.encrypted().is_some() {
+                found = Some((layer.clone(), path.clone()));
             }
-        };
-        let number = first
-            .to_str()
-            .and_then(|name| name.strip_prefix(PARTITION_PREFIX))
-            .map(|rest| rest.split(' ').next().unwrap_or_default())
-            .and_then(|number| number.parse::<u32>().ok());
-        let partition = self
-            .partitions
-            .iter()
-            .find(|p| Some(p.info.number) == number)
-            .ok_or_else(|| Error::NotFound(PathBuf::from(first)))?;
-        Ok(Some((partition, components.as_path())))
+            if index + 1 == names.len() {
+                break;
+            }
+            match layer.open(keys, &path) {
+                Ok((Opened::Volumes(volumes), _)) => layers = volumes,
+                // The rest of the path lies inside the filesystem.
+                Ok((Opened::Filesystem(_), _)) | Err(Error::VolumeLocked(_)) => break,
+                Err(err) => return Err(err),
+            }
+        }
+        found.ok_or_else(|| {
+            Error::Image(format!(
+                "“{}” is not encrypted",
+                self.key.1.join(inner).display()
+            ))
+        })
     }
 }
 
-fn partition_entry(partition: &OpenPartition, image_path: &Path) -> Entry {
-    let name = partition.name();
-    Entry {
-        path: image_path.join(&name),
-        name,
-        kind: if partition.info.fs.is_encrypted() {
-            EntryKind::Encrypted
-        } else {
-            match partition.info.fs.unsupported_reason() {
-                None => EntryKind::Partition,
-                Some(reason) => EntryKind::Unavailable {
-                    reason: reason.to_owned(),
-                },
-            }
-        },
-        size: partition.info.len,
-        mtime: None,
-        inside_image: true,
+/// The layer named by the path component `name` among `layers`, which lie in `parent`.
+fn child(layers: &[Arc<Layer>], name: &OsStr, parent: &Path) -> Result<Arc<Layer>> {
+    layers
+        .iter()
+        .find(|layer| layer.is_named(name))
+        .cloned()
+        .ok_or_else(|| Error::NotFound(parent.join(name)))
+}
+
+/// The folder name of a partition, e.g. "Partition 3 (C:)" with `drive` from `system.json`.
+fn partition_name(info: &Partition, drive: Option<char>) -> String {
+    let number = info.number;
+    let role = info.role.or((info.fs == FsKind::Lvm).then_some("LVM"));
+    match (drive, role) {
+        (Some(drive), _) => format!("{PARTITION_PREFIX}{number} ({drive}:)"),
+        (None, Some(role)) => format!("{PARTITION_PREFIX}{number} ({role})"),
+        (None, None) => format!("{PARTITION_PREFIX}{number}"),
     }
 }

@@ -26,10 +26,8 @@ impl FsKind {
     pub fn unsupported_reason(self) -> Option<&'static str> {
         Some(match self {
             Self::Ntfs | Self::Fat | Self::Ext | Self::Lvm => return None,
-            // Only met inside another encrypted volume, see `is_encrypted`.
-            Self::BitLocker | Self::Luks => {
-                "Encrypted volumes inside encrypted volumes can't be browsed"
-            }
+            // Browsed once unlocked, see `is_encrypted`.
+            Self::BitLocker | Self::Luks => return None,
             Self::ExFat => "exFAT filesystems can't be browsed yet",
             Self::Refs => "ReFS filesystems can't be browsed",
             Self::Unknown => "No supported filesystem",

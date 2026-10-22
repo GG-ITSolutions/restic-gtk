@@ -243,7 +243,8 @@ impl Session {
         }
     }
 
-    /// Unlocks the encrypted partition of a disk image that `path` is or lies in.
+    /// Unlocks the encrypted volume of a disk image that `path` is or lies in: the partition,
+    /// or with LVM in between the logical volume, that an [`Error::VolumeLocked`] named.
     ///
     /// `secret` is a BitLocker recovery password (48 digits, dashes optional), a BitLocker
     /// password or a LUKS passphrase. Fails with [`Error::WrongPassword`] if it doesn't fit.

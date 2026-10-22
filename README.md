@@ -39,10 +39,14 @@ no `restic` binary is needed.
   so are files that can't be read (EFS-encrypted, deduplicated, WIMBoot) and LVM volumes of a
   type that can't be read (thin, striped, snapshots). ext hard links are restored as separate
   files.
-- **Encrypted partitions** in disk images (BitLocker, LUKS1 and LUKS2) show a lock. Opening one
+- **Encrypted volumes** in disk images (BitLocker, LUKS1 and LUKS2) show a lock. Opening one
   asks for the BitLocker recovery key or password, or the LUKS passphrase. The key is not stored;
   until you lock the repository or quit, it stays in memory, so the same volume in other
-  snapshots opens without asking again. Restoring from a partition that is still locked fails.
+  snapshots opens without asking again. Restoring from a volume that is still locked fails.
+- **Layers stack** the way Linux and Windows set them up: whatever a partition can hold, an
+  unlocked volume or a logical volume can hold too. A LUKS partition with LVM and ext4 inside
+  (the usual encrypted Debian or Ubuntu install), a LUKS volume inside a logical volume, NTFS or
+  FAT under BitLocker or inside LVM, all of it also inside a qcow2, VHD(X) or VMDK container.
 - **ZIP archives** (`.zip`) open like folders, without downloading them: only the list of
   entries and the entries you open are read. Files and folders inside can be restored with
   their modification time. A `.zip` file that is not a ZIP archive opens like any other file.
@@ -111,7 +115,8 @@ New files must be known to git (`git add`), otherwise the flake doesn't see them
   only by the TPM, `.BEK` key files, AES-256-CBC with Elephant diffuser and Windows Vista volumes
   can't be opened, nor can LUKS volumes with another cipher than AES-XTS, with key files, or
   unlocked only by a TPM2 or FIDO2 token. LUKS2 volumes with Argon2 take a few seconds to
-  unlock, a bit longer than with cryptsetup, which uses several threads.
+  unlock, a bit longer than with cryptsetup, which uses several threads. An encrypted volume
+  directly inside another one (without LVM in between) can't be browsed.
 - ZIP archives: only `.zip` opens as a folder, not `.docx`, `.jar` and the like. Encrypted
   entries and entries compressed with Zstandard or PPMd are listed but can't be opened or
   restored, there is no password prompt yet. Links are listed and not restored, multi-part
