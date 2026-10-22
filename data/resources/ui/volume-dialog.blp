@@ -1,0 +1,87 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $ResticGtkVolumeDialog: Adw.Dialog {
+  title: _("Unlock Volume");
+  content-width: 420;
+  default-widget: unlock_button;
+  focus-widget: password_row;
+
+  child: Adw.ToolbarView {
+    [top]
+    Adw.HeaderBar {
+      show-start-title-buttons: false;
+      show-end-title-buttons: false;
+
+      [start]
+      Gtk.Button {
+        label: _("_Cancel");
+        use-underline: true;
+        clicked => $on_cancel() swapped;
+      }
+
+      [end]
+      Gtk.Button unlock_button {
+        sensitive: false;
+        clicked => $on_unlock() swapped;
+
+        child: Gtk.Stack unlock_stack {
+          hhomogeneous: false;
+
+          Gtk.StackPage {
+            name: "label";
+
+            child: Gtk.Label {
+              label: _("_Unlock");
+              use-underline: true;
+            };
+          }
+
+          Gtk.StackPage {
+            name: "busy";
+
+            child: Adw.Spinner {};
+          }
+        };
+
+        styles [
+          "suggested-action",
+        ]
+      }
+    }
+
+    content: Gtk.Box {
+      orientation: vertical;
+      spacing: 12;
+      margin-top: 12;
+      margin-bottom: 24;
+      margin-start: 12;
+      margin-end: 12;
+
+      Gtk.Label description_label {
+        xalign: 0;
+        wrap: true;
+      }
+
+      Adw.PreferencesGroup {
+        Adw.PasswordEntryRow password_row {
+          title: _("Recovery Key or Passphrase");
+          activates-default: true;
+          changed => $on_changed() swapped;
+        }
+      }
+
+      Gtk.Label error_label {
+        visible: false;
+        xalign: 0;
+        wrap: true;
+        selectable: true;
+
+        styles [
+          "error",
+          "caption",
+        ]
+      }
+    };
+  };
+}

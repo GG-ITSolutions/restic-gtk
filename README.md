@@ -32,6 +32,10 @@ no `restic` binary is needed.
   `backup-windows` writes next to its images. Files, folders and whole partitions inside images
   can be restored as well, with their content and modification time; links are left out, and
   so are files that can't be read (EFS-encrypted, deduplicated, WIMBoot).
+- **Encrypted partitions** in disk images (BitLocker, LUKS1 and LUKS2) show a lock. Opening one
+  asks for the BitLocker recovery key or password, or the LUKS passphrase. The key is not stored;
+  until you lock the repository or quit, it stays in memory, so the same volume in other
+  snapshots opens without asking again. Restoring from a partition that is still locked fails.
 - **Restore** selected files and folders into a folder of your choice, as
   `<folder>/<name>`. Before existing files are replaced, their number is shown and must be
   confirmed, then the restore shows its progress. A folder, file or link of another type in
@@ -80,10 +84,15 @@ New files must be known to git (`git add`), otherwise the flake doesn't see them
 - An unreachable endpoint fails only after about a minute, rustic retries every request.
 - A running restore can't be cancelled; rustic_core offers no way to abort it.
 - Restoring to non-UTF-8 target paths is not supported.
-- Disk images: ext2/3/4 and LVM, BitLocker and LUKS, qcow2/VHD(X)/VMDK and compressed images
+- Disk images: ext2/3/4 and LVM, qcow2/VHD(X)/VMDK and compressed images
   (`.img.gz`) can't be browsed yet. Restoring from images keeps no permissions, owners or
   alternate data streams. Changes still in the NTFS journal of an image of a running
   system are not applied.
+- Encrypted volumes need a recovery key, password or passphrase. BitLocker volumes protected
+  only by the TPM, `.BEK` key files, AES-256-CBC with Elephant diffuser and Windows Vista volumes
+  can't be opened, nor can LUKS volumes with another cipher than AES-XTS, with key files, or
+  unlocked only by a TPM2 or FIDO2 token. LUKS2 volumes with Argon2 take a few seconds to
+  unlock, a bit longer than with cryptsetup, which uses several threads.
 - Fragmented files in disk images are slow to open: every scattered piece fetches a whole blob
   (about 1 MiB) from the repository. Logs with NTFS compression are typical, a 79 MB Windows
   CBS log took about 90 s from a rest-server over the internet.

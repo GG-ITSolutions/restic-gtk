@@ -375,7 +375,7 @@ impl Session {
                 .expect("entries of an image are below it")
                 .to_path_buf();
             match entry.kind {
-                EntryKind::Dir | EntryKind::Partition => {
+                EntryKind::Dir | EntryKind::Partition | EntryKind::Encrypted => {
                     check_existing(&destination, |kind| Ok(kind.is_dir()))?;
                     for child in self.images.list(&image, &inner)? {
                         let name = child.path.file_name().unwrap_or_default().to_owned();

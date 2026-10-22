@@ -6,6 +6,7 @@ const BLUEPRINTS: &[&str] = &[
     "restore-dialog.blp",
     "snapshots-page.blp",
     "unlock-dialog.blp",
+    "volume-dialog.blp",
     "window.blp",
 ];
 

@@ -675,17 +675,25 @@ const LINUX_TYPE: [u8; 16] = [
     0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4,
 ];
 
-/// The NTFS volume of `tests/fixtures/generate-ntfs.sh`.
-fn ntfs_volume() -> Vec<u8> {
-    let file =
-        fs::File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ntfs.img.zst"))
-            .unwrap();
+/// A zstd compressed volume of `tests/fixtures`, decompressed.
+fn fixture_volume(file: &str) -> Vec<u8> {
+    let file = fs::File::open(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(file),
+    )
+    .unwrap();
     let mut volume = Vec::new();
     ruzstd::decoding::StreamingDecoder::new(file)
         .unwrap()
         .read_to_end(&mut volume)
         .unwrap();
     volume
+}
+
+/// The NTFS volume of `tests/fixtures/generate-ntfs.sh`.
+fn ntfs_volume() -> Vec<u8> {
+    fixture_volume("ntfs.img.zst")
 }
 
 /// A FAT volume with `/EFI/BOOT/hello.txt`.
@@ -710,16 +718,20 @@ fn fat_volume() -> Vec<u8> {
 
 /// A GPT disk: 1 EFI (FAT), 2 NTFS, 3 a Linux partition without a filesystem.
 fn disk_image() -> Vec<u8> {
-    let partitions = [
+    gpt_disk(&[
         (fat_volume(), EFI_TYPE),
         (ntfs_volume(), BASIC_DATA_TYPE),
         (vec![0; MIB], LINUX_TYPE),
-    ];
+    ])
+}
+
+/// A GPT disk with these partitions (data and type GUID), one after the other.
+fn gpt_disk(partitions: &[(Vec<u8>, [u8; 16])]) -> Vec<u8> {
     let size = 2 * MIB + partitions.iter().map(|p| p.0.len()).sum::<usize>();
     let mut disk = Cursor::new(vec![0; size]);
     let mut gpt = gptman::GPT::new_from(&mut disk, 512, [7; 16]).unwrap();
     let mut lba = 2048;
-    for (number, (data, kind)) in (1..).zip(&partitions) {
+    for (number, (data, kind)) in (1..).zip(partitions) {
         let sectors = data.len() as u64 / 512;
         gpt[number] = gptman::GPTPartitionEntry {
             partition_type_guid: *kind,
@@ -1025,4 +1037,246 @@ fn restore_from_a_disk_image_checks_the_target_first() {
         matches!(result, Err(Error::UnsupportedFilesystem(_))),
         "{result:?}"
     );
+}
+
+// --- encrypted volumes ---------------------------------------------------
+
+/// The encrypted volumes of `tests/fixtures/generate-encrypted.sh`, which says what they hold
+/// and what their keys are. Each volume is one partition: 1 BitLocker, 2 LUKS2, 3 LUKS1.
+const BITLOCKER: &str = "/data/disk.img/Partition 1";
+const LUKS2: &str = "/data/disk.img/Partition 2";
+const LUKS1: &str = "/data/disk.img/Partition 3";
+const BITLOCKER_PASSWORD: &str = "bitlocker fixture";
+const BITLOCKER_RECOVERY: &str = "013574-624679-047531-660000-008547-345565-299002-046662";
+const LUKS_PASSPHRASE: &str = "luks fixture";
+
+/// Images of the encrypted volumes, one for each of `images` (all the same).
+fn encrypted_fixture(images: &[&str]) -> Fixture {
+    let disk = gpt_disk(&[
+        (fixture_volume("bitlocker.img.zst"), BASIC_DATA_TYPE),
+        (fixture_volume("luks2.img.zst"), LINUX_TYPE),
+        (fixture_volume("luks1.img.zst"), LINUX_TYPE),
+    ]);
+    Fixture::with_source(|source| {
+        for image in images {
+            fs::write(source.join(image), &disk).unwrap();
+        }
+    })
+}
+
+fn is_locked(result: &Result<Vec<restic_gtk::backend::Entry>, Error>, partition: &str) -> bool {
+    matches!(result, Err(Error::VolumeLocked(path)) if path == Path::new(partition))
+}
+
+#[test]
+fn lists_encrypted_partitions_as_such() {
+    let fixture = encrypted_fixture(&["disk.img"]);
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    let partitions = session.list_dir(&snapshot, Path::new(IMAGE)).unwrap();
+    assert_eq!(
+        names(&partitions),
+        ["Partition 1", "Partition 2", "Partition 3"]
+    );
+    assert!(
+        partitions
+            .iter()
+            .all(|p| p.kind == EntryKind::Encrypted && p.inside_image)
+    );
+    assert_eq!(partitions[0].size, MIB as u64);
+}
+
+#[test]
+fn entering_an_encrypted_partition_needs_its_key() {
+    let fixture = encrypted_fixture(&["disk.img"]);
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    for partition in [BITLOCKER, LUKS2, LUKS1] {
+        let partition = Path::new(partition);
+        let result = session.list_dir(&snapshot, partition);
+        assert!(
+            is_locked(&result, partition.to_str().unwrap()),
+            "{result:?}"
+        );
+        // Anything below it too, and the error names the partition.
+        let result = session.list_dir(&snapshot, &partition.join("docs"));
+        assert!(
+            is_locked(&result, partition.to_str().unwrap()),
+            "{result:?}"
+        );
+        let result =
+            session.extract_file(&snapshot, &partition.join("hello.txt"), fixture.dir.path());
+        assert!(matches!(result, Err(Error::VolumeLocked(_))), "{result:?}");
+    }
+}
+
+#[test]
+fn wrong_keys_leave_the_volume_locked() {
+    let fixture = encrypted_fixture(&["disk.img"]);
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    let wrong_recovery = "013574-624679-047531-660000-008547-345565-299002-046673";
+    for (partition, secret) in [
+        (BITLOCKER, "nope"),
+        (BITLOCKER, wrong_recovery),
+        (BITLOCKER, LUKS_PASSPHRASE),
+        (LUKS2, "nope"),
+        (LUKS2, BITLOCKER_PASSWORD),
+        (LUKS1, ""),
+    ] {
+        let result = session.unlock_volume(&snapshot, Path::new(partition), secret);
+        assert!(
+            matches!(result, Err(Error::WrongPassword)),
+            "{partition} {secret}: {result:?}"
+        );
+        let result = session.list_dir(&snapshot, Path::new(partition));
+        assert!(is_locked(&result, partition), "{result:?}");
+    }
+
+    // Not an encrypted partition, or not in an image at all.
+    let result = session.unlock_volume(&snapshot, Path::new(IMAGE), "pw");
+    assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+    let result = session.unlock_volume(&snapshot, Path::new("/data"), "pw");
+    assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+}
+
+#[test]
+fn browses_and_opens_files_in_unlocked_volumes() {
+    let fixture = encrypted_fixture(&["disk.img"]);
+    for (partition, secret) in [
+        (BITLOCKER, BITLOCKER_PASSWORD),
+        (BITLOCKER, BITLOCKER_RECOVERY),
+        // The digits of a recovery password may be grouped otherwise.
+        (
+            BITLOCKER,
+            "013574 624679 047531 660000 008547 345565 299002 046662",
+        ),
+        (LUKS2, LUKS_PASSPHRASE),
+        (LUKS1, LUKS_PASSPHRASE),
+    ] {
+        // A new session each time, nothing is unlocked yet.
+        let session = fixture.open();
+        let snapshot = fixture.snapshot(&session);
+        let volume = Path::new(partition);
+
+        session.unlock_volume(&snapshot, volume, secret).unwrap();
+        let root = session.list_dir(&snapshot, volume).unwrap();
+        assert_eq!(
+            names(&root),
+            ["docs", "hello.txt", "pattern.bin"],
+            "{partition}"
+        );
+        assert!(root.iter().all(|e| e.inside_image));
+        let docs = session.list_dir(&snapshot, &volume.join("docs")).unwrap();
+        assert_eq!(names(&docs), ["sub", "readme.txt"]);
+
+        let extract = |path: &str| {
+            let file = session
+                .extract_file(&snapshot, &volume.join(path), fixture.dir.path())
+                .unwrap();
+            fs::read(file).unwrap()
+        };
+        assert_eq!(extract("hello.txt"), b"hello encrypted\n");
+        assert_eq!(extract("docs/sub/deep.txt"), b"deep\n");
+        let pattern = extract("pattern.bin");
+        assert_eq!(pattern.len(), 20_000);
+        assert!(
+            pattern
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == (i * 7 % 251) as u8)
+        );
+
+        // The partition listing is the same before and after.
+        let partitions = session.list_dir(&snapshot, Path::new(IMAGE)).unwrap();
+        assert!(partitions.iter().all(|p| p.kind == EntryKind::Encrypted));
+    }
+}
+
+#[test]
+fn keys_are_kept_for_the_session_and_fit_the_same_volume_only() {
+    let fixture = encrypted_fixture(&["disk.img", "other.img"]);
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    session
+        .unlock_volume(&snapshot, Path::new(BITLOCKER), BITLOCKER_RECOVERY)
+        .unwrap();
+    // The same volume in another image opens without asking, the other volumes don't.
+    let other =
+        |partition: u32| Path::new("/data/other.img").join(format!("Partition {partition}"));
+    let entries = session.list_dir(&snapshot, &other(1)).unwrap();
+    assert_eq!(names(&entries), ["docs", "hello.txt", "pattern.bin"]);
+    let result = session.list_dir(&snapshot, &other(2));
+    assert!(is_locked(&result, other(2).to_str().unwrap()), "{result:?}");
+
+    // Unlocking works the other way round as well, and again for a volume that is open already.
+    session
+        .unlock_volume(&snapshot, &other(2), LUKS_PASSPHRASE)
+        .unwrap();
+    assert!(session.list_dir(&snapshot, Path::new(LUKS2)).is_ok());
+    session
+        .unlock_volume(&snapshot, Path::new(BITLOCKER), BITLOCKER_PASSWORD)
+        .unwrap();
+    assert!(session.list_dir(&snapshot, Path::new(BITLOCKER)).is_ok());
+
+    // Nothing is kept beyond the session.
+    let again = fixture.open();
+    let result = again.list_dir(&fixture.snapshot(&again), Path::new(BITLOCKER));
+    assert!(is_locked(&result, BITLOCKER), "{result:?}");
+}
+
+#[test]
+fn restores_from_unlocked_volumes_and_refuses_locked_ones() {
+    let fixture = encrypted_fixture(&["disk.img"]);
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let target = fixture.folder("target");
+    let request = |items: &[&str]| RestoreRequest {
+        items: items.iter().map(PathBuf::from).collect(),
+        target: target.clone(),
+    };
+
+    let locked = request(&[LUKS2]);
+    for result in [
+        session.preview_restore(&snapshot, &locked).map(|_| ()),
+        session.restore(&snapshot, &locked, |_| {}).map(|_| ()),
+    ] {
+        assert!(matches!(result, Err(Error::VolumeLocked(_))), "{result:?}");
+    }
+    assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+
+    session
+        .unlock_volume(&snapshot, Path::new(LUKS2), LUKS_PASSPHRASE)
+        .unwrap();
+    session
+        .unlock_volume(&snapshot, Path::new(BITLOCKER), BITLOCKER_RECOVERY)
+        .unwrap();
+    let both = request(&[LUKS2, "/data/disk.img/Partition 1/docs"]);
+    let preview = session.preview_restore(&snapshot, &both).unwrap();
+    assert_eq!((preview.files, preview.conflicts), (6, 0));
+    let summary = session.restore(&snapshot, &both, |_| {}).unwrap();
+    assert_eq!(summary.skipped, 0);
+    assert_eq!(
+        fs::read_to_string(target.join("Partition 2/docs/sub/deep.txt")).unwrap(),
+        "deep\n"
+    );
+    assert_eq!(
+        fs::read(target.join("Partition 2/pattern.bin"))
+            .unwrap()
+            .len(),
+        20_000
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("docs/readme.txt")).unwrap(),
+        "readme\n"
+    );
+
+    // The third volume is still locked, and nothing of it is written.
+    let result = session.restore(&snapshot, &request(&[LUKS1]), |_| {});
+    assert!(matches!(result, Err(Error::VolumeLocked(_))), "{result:?}");
+    assert!(!target.join("Partition 3").exists());
 }

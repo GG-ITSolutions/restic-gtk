@@ -7,7 +7,7 @@ use std::{
 use adw::{prelude::*, subclass::prelude::*};
 use gtk::{CompositeTemplate, gdk, gio, glib, glib::clone};
 use restic_gtk::{
-    backend::{EntryKind, RestoreRequest, Snapshot, is_disk_image, jiff::Timestamp},
+    backend::{EntryKind, Error, RestoreRequest, Snapshot, is_disk_image, jiff::Timestamp},
     config,
 };
 
@@ -17,6 +17,7 @@ use crate::ui::{
     path_bar::PathBar,
     restore_dialog::RestoreDialog,
     run_blocking, set_plain_description, show_toast,
+    volume_dialog::VolumeDialog,
 };
 
 /// How long a folder may take to load before the spinner shows, to avoid flicker.
@@ -218,6 +219,12 @@ impl BrowserPage {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
         let obj = self.obj();
+        // What to go back to if the folder turns out to be a locked volume.
+        let previous = self
+            .stack
+            .visible_child_name()
+            .filter(|name| name != "loading")
+            .unwrap_or_else(|| "list".into());
 
         glib::timeout_add_local_once(
             SPINNER_DELAY,
@@ -238,7 +245,8 @@ impl BrowserPage {
             obj,
             async move {
                 let listed = path.clone();
-                let result = run_blocking(move || session.list_dir(&snapshot, &listed)).await;
+                let (worker, listed_snapshot) = (session.clone(), snapshot.clone());
+                let result = run_blocking(move || worker.list_dir(&listed_snapshot, &listed)).await;
                 let imp = obj.imp();
                 if imp.generation.get() != generation {
                     return;
@@ -260,6 +268,13 @@ impl BrowserPage {
                             imp.stack.set_visible_child_name("list");
                             imp.column_view
                                 .scroll_to(0, None, gtk::ListScrollFlags::FOCUS, None);
+                        }
+                    }
+                    // Keep showing the folder we came from, ask for the key and try again.
+                    Err(Error::VolumeLocked(partition)) => {
+                        imp.stack.set_visible_child_name(&previous);
+                        if VolumeDialog::run(&obj, session, snapshot, &partition).await {
+                            imp.load_dir(path, false);
                         }
                     }
                     Err(_) if fall_back_to_root => imp.load_dir(PathBuf::from("/"), false),
@@ -302,7 +317,11 @@ impl BrowserPage {
             selected.as_slice(),
             [entry] if matches!(
                 entry.entry().kind,
-                EntryKind::Dir | EntryKind::File | EntryKind::DiskImage | EntryKind::Partition
+                EntryKind::Dir
+                    | EntryKind::File
+                    | EntryKind::DiskImage
+                    | EntryKind::Partition
+                    | EntryKind::Encrypted
             )
         );
         let restorable = !selected.is_empty()
@@ -328,7 +347,7 @@ impl BrowserPage {
     fn activate_entry(&self, entry: &EntryObject) {
         let entry = entry.entry();
         match &entry.kind {
-            EntryKind::Dir | EntryKind::DiskImage | EntryKind::Partition => {
+            EntryKind::Dir | EntryKind::DiskImage | EntryKind::Partition | EntryKind::Encrypted => {
                 self.load_dir(entry.path.clone(), false)
             }
             EntryKind::File => self.open_file(entry.path.clone()),
