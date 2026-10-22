@@ -20,11 +20,9 @@ impl FsKind {
     /// Why the partition can't be browsed, for kinds that can't.
     pub fn unsupported_reason(self) -> Option<&'static str> {
         Some(match self {
-            Self::Ntfs | Self::Fat => return None,
+            Self::Ntfs | Self::Fat | Self::Ext | Self::Lvm => return None,
             Self::BitLocker => "Encrypted with BitLocker, which can't be browsed yet",
             Self::Luks => "Encrypted with LUKS, which can't be browsed yet",
-            Self::Ext => "ext2/3/4 filesystems can't be browsed yet",
-            Self::Lvm => "LVM volumes can't be browsed yet",
             Self::ExFat => "exFAT filesystems can't be browsed yet",
             Self::Refs => "ReFS filesystems can't be browsed",
             Self::Unknown => "No supported filesystem",
@@ -136,7 +134,7 @@ fn guid_bytes(text: &str) -> [u8; 16] {
 }
 
 /// Detects the filesystem from the boot sector and superblocks at `start`.
-fn detect_fs<R: Read + Seek>(disk: &mut R, start: u64) -> io::Result<FsKind> {
+pub(super) fn detect_fs<R: Read + Seek>(disk: &mut R, start: u64) -> io::Result<FsKind> {
     let mut head = vec![0; 4096];
     disk.seek(SeekFrom::Start(start))?;
     let mut filled = 0;
@@ -165,7 +163,8 @@ fn detect_fs_in(head: &[u8]) -> FsKind {
         FsKind::Fat
     } else if at(0, b"LUKS\xba\xbe") {
         FsKind::Luks
-    } else if at(512, b"LABELONE") {
+    } else if (0..4).any(|sector| at(sector * 512, b"LABELONE")) {
+        // LVM writes its label to sector 1, but accepts it in any of the first four.
         FsKind::Lvm
     } else if at(0x438, &[0x53, 0xEF]) {
         FsKind::Ext
@@ -199,7 +198,10 @@ mod tests {
         assert_eq!(detect_fs_in(&with(3, b"NTFS    ")), FsKind::Ntfs);
         assert_eq!(detect_fs_in(&with(3, b"-FVE-FS-")), FsKind::BitLocker);
         assert_eq!(detect_fs_in(&with(0, b"LUKS\xba\xbe")), FsKind::Luks);
-        assert_eq!(detect_fs_in(&with(512, b"LABELONE")), FsKind::Lvm);
+        for sector in 0..4 {
+            assert_eq!(detect_fs_in(&with(sector * 512, b"LABELONE")), FsKind::Lvm);
+        }
+        assert_eq!(detect_fs_in(&with(4 * 512, b"LABELONE")), FsKind::Unknown);
         assert_eq!(detect_fs_in(&with(0x438, &[0x53, 0xEF])), FsKind::Ext);
         let mut fat = with(0x52, b"FAT32   ");
         fat[510..512].copy_from_slice(&[0x55, 0xAA]);

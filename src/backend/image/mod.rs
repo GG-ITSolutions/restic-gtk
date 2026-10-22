@@ -5,7 +5,9 @@
 //! partitions, below that the files of the filesystem.
 
 mod container;
+mod ext;
 mod fat;
+mod lvm;
 mod lznt1;
 mod lzx;
 mod ntfs;
@@ -25,7 +27,9 @@ use rustic_core::repofile::Node;
 
 use self::{
     container::Disk,
+    ext::ExtVolume,
     fat::FatVolume,
+    lvm::LvmVolume,
     ntfs::NtfsVolume,
     partition::{FsKind, Partition},
     reader::{Slice, SnapshotReader},
@@ -106,13 +110,19 @@ struct OpenPartition {
 enum Volume {
     Ntfs(NtfsVolume),
     Fat,
+    Ext,
+    Lvm(LvmVolume),
 }
 
 impl OpenPartition {
     /// The folder name of the partition, e.g. "Partition 3 (C:)".
     fn name(&self) -> String {
         let number = self.info.number;
-        match (self.drive, self.info.role) {
+        let role = self
+            .info
+            .role
+            .or((self.info.fs == FsKind::Lvm).then_some("LVM"));
+        match (self.drive, role) {
             (Some(drive), _) => format!("{PARTITION_PREFIX}{number} ({drive}:)"),
             (None, Some(role)) => format!("{PARTITION_PREFIX}{number} ({role})"),
             (None, None) => format!("{PARTITION_PREFIX}{number}"),
@@ -131,6 +141,8 @@ impl OpenPartition {
         let opened = Arc::new(match self.info.fs {
             FsKind::Ntfs => Volume::Ntfs(NtfsVolume::open(&mut self.slice(image))?),
             FsKind::Fat => Volume::Fat,
+            FsKind::Ext => Volume::Ext,
+            FsKind::Lvm => Volume::Lvm(LvmVolume::open(self.slice(image))?),
             other => {
                 return Err(Error::UnsupportedFilesystem(
                     other.unsupported_reason().unwrap_or_default().to_owned(),
@@ -159,6 +171,10 @@ impl ImageCache {
                 volume.list(&mut partition.slice(&open.reader), rest, &virtual_path)
             }
             Volume::Fat => FatVolume::list(partition.slice(&open.reader), rest, &virtual_path),
+            Volume::Ext => ExtVolume::list(partition.slice(&open.reader), rest, &virtual_path),
+            Volume::Lvm(volume) => {
+                volume.list(|| partition.slice(&open.reader), rest, &virtual_path)
+            }
         }
     }
 
@@ -174,6 +190,10 @@ impl ImageCache {
                 volume.write_file(&mut partition.slice(&open.reader), rest, &shown, out)
             }
             Volume::Fat => FatVolume::write_file(partition.slice(&open.reader), rest, &shown, out),
+            Volume::Ext => ExtVolume::write_file(partition.slice(&open.reader), rest, &shown, out),
+            Volume::Lvm(volume) => {
+                volume.write_file(|| partition.slice(&open.reader), rest, &shown, out)
+            }
         }
     }
 

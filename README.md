@@ -26,8 +26,9 @@ no `restic` binary is needed.
 - **Open** a file with its default app. It is extracted read-only to
   `$XDG_RUNTIME_DIR/restic-gtk/` and removed when the app quits.
 - **Disk images** (`.img`, `.raw`, `.dd`, and the VM disk formats `.qcow2`, `.vhd`, `.vhdx`,
-  `.vmdk`) open like folders, without downloading them: first
-  the partitions (GPT or MBR), then the files of NTFS and FAT volumes. Opening a file reads only
+  `.vmdk`) open like folders, without downloading them: first the partitions (GPT or MBR), then
+  the files of NTFS, FAT and ext2/3/4 volumes; Linux LVM2 volumes show their logical volumes
+  (`vg0-root`) as folders. Opening a file reads only
   its blocks; files Windows stores compressed (CompactOS/WOF with XPRESS or LZX, NTFS
   compression) are decompressed. qcow2 (also compressed), VHD and VHDX (fixed and dynamic) and
   VMDK (sparse, flat and split files next to their descriptor) are read in place; disks that need
@@ -35,7 +36,9 @@ no `restic` binary is needed.
   log to replay show why they can't be opened. Drive letters come from the `system.json` that
   `backup-windows` writes next to its images. Files, folders and whole partitions inside images
   can be restored as well, with their content and modification time; links are left out, and
-  so are files that can't be read (EFS-encrypted, deduplicated, WIMBoot).
+  so are files that can't be read (EFS-encrypted, deduplicated, WIMBoot) and LVM volumes of a
+  type that can't be read (thin, striped, snapshots). ext hard links are restored as separate
+  files.
 - **Restore** selected files and folders into a folder of your choice, as
   `<folder>/<name>`. Before existing files are replaced, their number is shown and must be
   confirmed, then the restore shows its progress. A folder, file or link of another type in
@@ -84,13 +87,19 @@ New files must be known to git (`git add`), otherwise the flake doesn't see them
 - An unreachable endpoint fails only after about a minute, rustic retries every request.
 - A running restore can't be cancelled; rustic_core offers no way to abort it.
 - Restoring to non-UTF-8 target paths is not supported.
-- Disk images: ext2/3/4 and LVM, BitLocker and LUKS and compressed images (`.img.gz`) can't be
-  browsed yet. Of the VM disk formats, qcow2 with a backing file, VHD/VHDX differencing disks,
-  VMDK snapshots, encrypted or extended-L2 qcow2 and VHDX files with a log to replay are
-  refused. The extent files of a VMDK (`-flat`, `-s001`, ...) show up as images of their own.
-  Restoring from images keeps no permissions, owners or
-  alternate data streams. Changes still in the NTFS journal of an image of a running
-  system are not applied.
+- Disk images: BitLocker and LUKS and compressed images (`.img.gz`) can't be browsed yet. Of
+  the VM disk formats, qcow2 with a backing file, VHD/VHDX differencing disks, VMDK snapshots,
+  encrypted or extended-L2 qcow2 and VHDX files with a log to replay are refused. The extent
+  files of a VMDK (`-flat`, `-s001`, ...) show up as images of their own. Restoring from
+  images keeps no permissions, owners or alternate data streams. Changes still in the NTFS
+  journal of an image of a running system are not applied.
+- LVM volumes are browsable only if linear or mirrored (RAID1) on the one physical volume of
+  the image; thin, striped, snapshot and RAID5/6 volumes and volume groups spanning several
+  images are listed as unavailable. ext filesystems with unsupported features (see the
+  message) can't be read; encrypted (fscrypt) files and folders can't be read and are skipped
+  on restore, as are files with a time before 1970. Images of running (not cleanly unmounted)
+  ext3/ext4 systems can only be browsed if the filesystem has the 64bit feature and its
+  journal uses checksum v3 (journal_checksum, the default on current ext4).
 - Fragmented files in disk images are slow to open: every scattered piece fetches a whole blob
   (about 1 MiB) from the repository. Logs with NTFS compression are typical, a 79 MB Windows
   CBS log took about 90 s from a rest-server over the internet.

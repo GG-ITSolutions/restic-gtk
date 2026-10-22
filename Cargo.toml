@@ -18,13 +18,17 @@ url = "2"
 async-channel = "2"
 thiserror = "2"
 dirs = "6"
-# Disk images in snapshots: partition tables, filesystems and Windows file compression.
+# Disk images in snapshots: partition tables, filesystems (NTFS, FAT, ext2/3/4), LVM2 and
+# Windows file compression.
 gptman = "3"
 mbrman = "0.6"
 ntfs = "0.4"
 fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"] }
 lznt1 = "0.1"
 xpress-huffman = "0.1"
+ext4-view = { version = "1", features = ["std"] }
+lamlvm = "0.1.3"
+embedded-io = { version = "0.6", features = ["std"] }
 # Container formats of disk images: compressed qcow2 clusters and VMDK grains.
 miniz_oxide = "0.9"
 zstd = "0.13"
