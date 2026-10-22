@@ -65,10 +65,10 @@ enum Item {
 
 /// Everything to write for one entry inside a disk image.
 struct ImagePlan {
-    /// The image file and the `system.json` next to it.
+    /// The image file and the files next to it.
     node: Node,
     path: PathBuf,
-    system_json: Option<Node>,
+    siblings: Vec<Node>,
     /// Folders to create, parents first.
     dirs: Vec<PathBuf>,
     files: Vec<ImageFile>,
@@ -234,7 +234,7 @@ impl Session {
             snapshot,
             &plan.node,
             &plan.path,
-            plan.system_json.clone(),
+            plan.siblings.clone(),
         );
         let mut skipped = plan.skipped;
         let mut done = 0;
@@ -302,7 +302,7 @@ impl Session {
                         node,
                         path: image_path,
                         inner,
-                        system_json,
+                        siblings,
                     } => {
                         return self
                             .plan_image(
@@ -311,7 +311,7 @@ impl Session {
                                 ImagePlan {
                                     node,
                                     path: image_path,
-                                    system_json,
+                                    siblings,
                                     dirs: Vec::new(),
                                     files: Vec::new(),
                                     skipped: 0,
@@ -349,7 +349,7 @@ impl Session {
             snapshot,
             &plan.node,
             &plan.path,
-            plan.system_json.clone(),
+            plan.siblings.clone(),
         );
         let shown = plan.path.join(inner);
         // The parent's listing has the size and time of the entry.

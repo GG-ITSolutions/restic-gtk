@@ -25,10 +25,14 @@ no `restic` binary is needed.
 - **File browser** per snapshot with path bar and keyboard navigation (Enter, Alt+↑, Backspace).
 - **Open** a file with its default app. It is extracted read-only to
   `$XDG_RUNTIME_DIR/restic-gtk/` and removed when the app quits.
-- **Disk images** (`.img`, `.raw`, `.dd`) open like folders, without downloading them: first
+- **Disk images** (`.img`, `.raw`, `.dd`, and the VM disk formats `.qcow2`, `.vhd`, `.vhdx`,
+  `.vmdk`) open like folders, without downloading them: first
   the partitions (GPT or MBR), then the files of NTFS and FAT volumes. Opening a file reads only
   its blocks; files Windows stores compressed (CompactOS/WOF with XPRESS or LZX, NTFS
-  compression) are decompressed. Drive letters come from the `system.json` that
+  compression) are decompressed. qcow2 (also compressed), VHD and VHDX (fixed and dynamic) and
+  VMDK (sparse, flat and split files next to their descriptor) are read in place; disks that need
+  a parent image (backing files, differencing disks, VMware snapshots) or a VHDX with a
+  log to replay show why they can't be opened. Drive letters come from the `system.json` that
   `backup-windows` writes next to its images. Files, folders and whole partitions inside images
   can be restored as well, with their content and modification time; links are left out, and
   so are files that can't be read (EFS-encrypted, deduplicated, WIMBoot).
@@ -80,8 +84,11 @@ New files must be known to git (`git add`), otherwise the flake doesn't see them
 - An unreachable endpoint fails only after about a minute, rustic retries every request.
 - A running restore can't be cancelled; rustic_core offers no way to abort it.
 - Restoring to non-UTF-8 target paths is not supported.
-- Disk images: ext2/3/4 and LVM, BitLocker and LUKS, qcow2/VHD(X)/VMDK and compressed images
-  (`.img.gz`) can't be browsed yet. Restoring from images keeps no permissions, owners or
+- Disk images: ext2/3/4 and LVM, BitLocker and LUKS and compressed images (`.img.gz`) can't be
+  browsed yet. Of the VM disk formats, qcow2 with a backing file, VHD/VHDX differencing disks,
+  VMDK snapshots, encrypted or extended-L2 qcow2 and VHDX files with a log to replay are
+  refused. The extent files of a VMDK (`-flat`, `-s001`, ...) show up as images of their own.
+  Restoring from images keeps no permissions, owners or
   alternate data streams. Changes still in the NTFS journal of an image of a running
   system are not applied.
 - Fragmented files in disk images are slow to open: every scattered piece fetches a whole blob

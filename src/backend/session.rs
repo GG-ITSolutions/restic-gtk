@@ -1,7 +1,6 @@
 use std::{
     cmp::Ordering,
     collections::BTreeMap,
-    ffi::OsStr,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -33,8 +32,8 @@ pub(crate) enum Location {
         path: PathBuf,
         /// The path inside the image, empty for the image itself.
         inner: PathBuf,
-        /// A `system.json` next to the image, if there is one.
-        system_json: Option<Node>,
+        /// The files in the folder of the image, itself included.
+        siblings: Vec<Node>,
     },
 }
 
@@ -189,15 +188,11 @@ impl Session {
                 return Err(Error::NotFound(walked));
             };
             if node.is_file() && image::is_image_name(name) {
-                let system_json = nodes
-                    .iter()
-                    .find(|n| n.is_file() && n.name() == OsStr::new(image::SYSTEM_JSON))
-                    .cloned();
                 return Ok(Location::Image {
                     node: node.clone(),
                     path: walked,
                     inner: components.as_path().to_path_buf(),
-                    system_json,
+                    siblings: nodes,
                 });
             }
             match node.subtree {
@@ -219,14 +214,14 @@ impl Session {
         snapshot: &Snapshot,
         node: &'a Node,
         path: &'a Path,
-        system_json: Option<Node>,
+        siblings: Vec<Node>,
     ) -> ImageRef<'a> {
         ImageRef {
             repo,
             tree: snapshot.tree.to_string(),
             node,
             path,
-            system_json,
+            siblings,
         }
     }
 
@@ -251,9 +246,9 @@ impl Session {
                 node,
                 path: image_path,
                 inner,
-                system_json,
+                siblings,
             } => {
-                let image = self.image_ref(&repo, snapshot, &node, &image_path, system_json);
+                let image = self.image_ref(&repo, snapshot, &node, &image_path, siblings);
                 self.images.list(&image, &inner)?
             }
         };
