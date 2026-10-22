@@ -18,8 +18,9 @@ use super::{
     session::{IndexedRepo, Location},
 };
 
-/// Appended to the name of a file from a disk image while it is written.
-const PART_SUFFIX: &str = ".restic-gtk-part";
+/// A file from a disk image is written under this name in its destination's folder, then
+/// renamed; the name itself may be up to 255 bytes, so no suffix fits behind it.
+const PART_NAME: &str = ".restic-gtk.part";
 
 /// Bytes between two progress reports while writing a file from a disk image.
 const REPORT_EVERY: u64 = 256 * 1024;
@@ -239,9 +240,8 @@ impl Session {
         let mut skipped = plan.skipped;
         let mut done = 0;
         for file in plan.files_to_write() {
-            let mut name = file.destination.clone().into_os_string();
-            name.push(PART_SUFFIX);
-            let part = PathBuf::from(name);
+            // Files are written one after the other, so one temp name per folder is enough.
+            let part = file.destination.with_file_name(PART_NAME);
             let written = (|| {
                 // Never through a link someone left at this name.
                 match fs::remove_file(&part) {
@@ -364,6 +364,7 @@ impl Session {
         }
         let destination = target.join(entry.path.file_name().ok_or(Error::NotFound(shown))?);
 
+        let top = entry.path.clone();
         let mut pending = vec![(entry, destination)];
         let mut dirs = Vec::new();
         let mut files = Vec::new();
@@ -377,7 +378,15 @@ impl Session {
             match entry.kind {
                 EntryKind::Dir | EntryKind::Partition => {
                     check_existing(&destination, |kind| Ok(kind.is_dir()))?;
-                    for child in self.images.list(&image, &inner)? {
+                    let children = match self.images.list(&image, &inner) {
+                        // An encrypted folder below the picked entry is left out like a link.
+                        Err(Error::UnsupportedFile { .. }) if entry.path != top => {
+                            skipped += 1;
+                            continue;
+                        }
+                        children => children?,
+                    };
+                    for child in children {
                         let name = child.path.file_name().unwrap_or_default().to_owned();
                         pending.push((child, destination.join(name)));
                     }
@@ -393,7 +402,7 @@ impl Session {
                         mtime: entry.mtime,
                     });
                 }
-                // Links point to Windows paths, which mean nothing here.
+                // Links point to paths inside the image, which mean nothing here.
                 EntryKind::Symlink { .. } | EntryKind::Special | EntryKind::Unavailable { .. } => {
                     skipped += 1
                 }
