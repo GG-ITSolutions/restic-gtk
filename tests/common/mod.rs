@@ -32,13 +32,21 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn new() -> Self {
+        Self::with_source(|source| {
+            write(&source.join("docs/readme.txt"), "hello\n");
+            write(&source.join("docs/sub/deep.txt"), "deep\n");
+            fs::create_dir_all(source.join("empty")).unwrap();
+            write(&source.join("größe.txt"), "unicode\n");
+            symlink("docs/readme.txt", source.join("link")).unwrap();
+        })
+    }
+
+    /// Like [`Self::new`], with the source folder filled by `fill` instead.
+    pub fn with_source(fill: impl FnOnce(&Path)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source");
-        write(&source.join("docs/readme.txt"), "hello\n");
-        write(&source.join("docs/sub/deep.txt"), "deep\n");
-        fs::create_dir_all(source.join("empty")).unwrap();
-        write(&source.join("größe.txt"), "unicode\n");
-        symlink("docs/readme.txt", source.join("link")).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        fill(&source);
 
         let location = dir.path().join("repo").to_str().unwrap().to_owned();
         let backends = BackendOptions::default()

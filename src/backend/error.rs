@@ -23,6 +23,35 @@ pub enum Error {
     #[error("“{0}” is not a regular file")]
     NotAFile(PathBuf),
 
+    #[error("“{0}” does not exist")]
+    NotFound(PathBuf),
+
+    /// A file inside a disk image whose contents can't be read, e.g. an encrypted one.
+    #[error("“{path}” can't be opened. {reason}")]
+    UnsupportedFile { path: PathBuf, reason: String },
+
+    /// A partition of a disk image without a filesystem that can be browsed.
+    #[error("{0}")]
+    UnsupportedFilesystem(String),
+
+    /// An encrypted partition of a disk image, given by its path, that has to be unlocked first,
+    /// see [`Session::unlock_volume`](super::Session::unlock_volume).
+    #[error("“{0}” is encrypted and locked")]
+    VolumeLocked(PathBuf),
+
+    /// A disk image that can't be read, e.g. a damaged filesystem.
+    #[error("{0}")]
+    Image(String),
+
+    /// A ZIP archive entry that can't be read, e.g. a damaged one.
+    #[error("{0}")]
+    Archive(String),
+
+    /// A file that is named like an archive but can't be browsed as one, e.g. not a ZIP file.
+    /// Opening it as a plain file still works.
+    #[error("{0}")]
+    NotAnArchive(String),
+
     /// The restore target has something else where an entry goes.
     #[error("“{path}” already exists as {existing}")]
     TargetExists {

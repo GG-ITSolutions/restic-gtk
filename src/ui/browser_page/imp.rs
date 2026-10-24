@@ -7,7 +7,9 @@ use std::{
 use adw::{prelude::*, subclass::prelude::*};
 use gtk::{CompositeTemplate, gdk, gio, glib, glib::clone};
 use restic_gtk::{
-    backend::{EntryKind, RestoreRequest, Snapshot, jiff::Timestamp},
+    backend::{
+        EntryKind, Error, RestoreRequest, Snapshot, is_disk_image, is_zip_archive, jiff::Timestamp,
+    },
     config,
 };
 
@@ -17,6 +19,7 @@ use crate::ui::{
     path_bar::PathBar,
     restore_dialog::RestoreDialog,
     run_blocking, set_plain_description, show_toast,
+    volume_dialog::VolumeDialog,
 };
 
 /// How long a folder may take to load before the spinner shows, to avoid flicker.
@@ -199,9 +202,14 @@ impl BrowserPage {
     }
 
     /// Starts in the backed up folder if there is exactly one, which is where the files are.
+    ///
+    /// Not in a disk image or ZIP archive though: the other files of the snapshot, e.g. a
+    /// `system.json` next to it, would be out of sight.
     fn load_start_folder(&self) {
         match self.snapshot().paths.as_slice() {
-            [single] => self.load_dir(PathBuf::from(single), true),
+            [single] if !is_disk_image(Path::new(single)) && !is_zip_archive(Path::new(single)) => {
+                self.load_dir(PathBuf::from(single), true)
+            }
             _ => self.load_dir(PathBuf::from("/"), false),
         }
     }
@@ -213,6 +221,12 @@ impl BrowserPage {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
         let obj = self.obj();
+        // What to go back to if the folder turns out to be a locked volume.
+        let previous = self
+            .stack
+            .visible_child_name()
+            .filter(|name| name != "loading")
+            .unwrap_or_else(|| "list".into());
 
         glib::timeout_add_local_once(
             SPINNER_DELAY,
@@ -233,7 +247,8 @@ impl BrowserPage {
             obj,
             async move {
                 let listed = path.clone();
-                let result = run_blocking(move || session.list_dir(&snapshot, &listed)).await;
+                let (worker, listed_snapshot) = (session.clone(), snapshot.clone());
+                let result = run_blocking(move || worker.list_dir(&listed_snapshot, &listed)).await;
                 let imp = obj.imp();
                 if imp.generation.get() != generation {
                     return;
@@ -256,6 +271,19 @@ impl BrowserPage {
                             imp.column_view
                                 .scroll_to(0, None, gtk::ListScrollFlags::FOCUS, None);
                         }
+                    }
+                    // Keep showing the folder we came from, ask for the key and try again.
+                    Err(Error::VolumeLocked(partition)) => {
+                        imp.stack.set_visible_child_name(&previous);
+                        if VolumeDialog::run(&obj, session, snapshot, &partition).await {
+                            imp.load_dir(path, false);
+                        }
+                    }
+                    // Named like an archive, but isn't one: open it as the file it is.
+                    Err(Error::NotAnArchive(reason)) => {
+                        imp.stack.set_visible_child_name("list");
+                        show_toast(&obj, &format!("{reason}. Opening it as a file instead."));
+                        imp.open_file(path);
                     }
                     Err(_) if fall_back_to_root => imp.load_dir(PathBuf::from("/"), false),
                     Err(err) => {
@@ -295,11 +323,23 @@ impl BrowserPage {
         let selected = self.selected_entries();
         let openable = matches!(
             selected.as_slice(),
-            [entry] if matches!(entry.entry().kind, EntryKind::Dir | EntryKind::File)
+            [entry] if matches!(
+                entry.entry().kind,
+                EntryKind::Dir
+                    | EntryKind::File
+                    | EntryKind::DiskImage
+                    | EntryKind::ZipArchive
+                    | EntryKind::Partition
+                    | EntryKind::Encrypted
+            )
         );
+        let restorable = !selected.is_empty()
+            && selected
+                .iter()
+                .all(|e| !matches!(e.entry().kind, EntryKind::Unavailable { .. }));
         let obj = self.obj();
         obj.action_set_enabled("browser.open", openable);
-        obj.action_set_enabled("browser.restore", !selected.is_empty());
+        obj.action_set_enabled("browser.restore", restorable);
         self.selection_label.set_label(&match selected.len() {
             0 => String::new(),
             1 => "1 item selected".to_owned(),
@@ -316,7 +356,11 @@ impl BrowserPage {
     fn activate_entry(&self, entry: &EntryObject) {
         let entry = entry.entry();
         match &entry.kind {
-            EntryKind::Dir => self.load_dir(entry.path.clone(), false),
+            EntryKind::Dir
+            | EntryKind::DiskImage
+            | EntryKind::ZipArchive
+            | EntryKind::Partition
+            | EntryKind::Encrypted => self.load_dir(entry.path.clone(), false),
             EntryKind::File => self.open_file(entry.path.clone()),
             EntryKind::Symlink { target } => show_toast(
                 &*self.obj(),
@@ -326,6 +370,9 @@ impl BrowserPage {
                 &*self.obj(),
                 &format!("“{}” is a special file and can't be opened", entry.name),
             ),
+            EntryKind::Unavailable { reason } => {
+                show_toast(&*self.obj(), &format!("“{}”: {reason}", entry.name))
+            }
         }
     }
 
@@ -401,8 +448,10 @@ impl BrowserPage {
                 };
 
                 let request = RestoreRequest { items, target };
-                if RestoreDialog::run(&obj, session, snapshot, request.clone()).await {
-                    show_restored_toast(&obj, &request.target);
+                if let Some(summary) =
+                    RestoreDialog::run(&obj, session, snapshot, request.clone()).await
+                {
+                    show_restored_toast(&obj, &request.target, summary.skipped);
                     obj.imp().selection.unselect_all();
                 }
             }
@@ -410,12 +459,20 @@ impl BrowserPage {
     }
 }
 
-fn show_restored_toast(widget: &impl IsA<gtk::Widget>, target: &Path) {
+fn show_restored_toast(widget: &impl IsA<gtk::Widget>, target: &Path, skipped: u64) {
+    let mut title = format!("Restored to “{}”", target.display());
+    if skipped > 0 {
+        title += &format!(
+            ", {} skipped",
+            format::count(
+                skipped,
+                "link or unsupported file",
+                "links or unsupported files"
+            )
+        );
+    }
     let toast = adw::Toast::builder()
-        .title(glib::markup_escape_text(&format!(
-            "Restored to “{}”",
-            target.display()
-        )))
+        .title(glib::markup_escape_text(&title))
         .button_label("Open Folder")
         .build();
     let folder = gio::File::for_path(target);

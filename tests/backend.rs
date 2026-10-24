@@ -2,6 +2,7 @@ mod common;
 
 use std::{
     fs,
+    io::{Cursor, Read, Write},
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -624,7 +625,7 @@ fn restore_refuses_entries_of_another_type_in_target() {
         };
         for result in [
             session.preview_restore(&snapshot, &request).map(|_| ()),
-            session.restore(&snapshot, &request, |_| {}),
+            session.restore(&snapshot, &request, |_| {}).map(|_| ()),
         ] {
             match result {
                 Err(Error::TargetExists { path, existing: e }) => {
@@ -656,4 +657,1364 @@ fn restoring_the_same_entries_again_is_no_clash() {
     };
     session.restore(&snapshot, &request, |_| {}).unwrap();
     session.restore(&snapshot, &request, |_| {}).unwrap();
+}
+
+// --- disk images ---------------------------------------------------------
+
+const MIB: usize = 1 << 20;
+const IMAGE: &str = "/data/disk.img";
+
+/// GPT type GUIDs as stored on disk.
+const EFI_TYPE: [u8; 16] = [
+    0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b,
+];
+const BASIC_DATA_TYPE: [u8; 16] = [
+    0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7,
+];
+const LINUX_TYPE: [u8; 16] = [
+    0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4,
+];
+
+/// The decompressed zstd fixture at `path`.
+fn unzstd(path: &Path) -> Vec<u8> {
+    let file = fs::File::open(path).unwrap();
+    let mut data = Vec::new();
+    ruzstd::decoding::StreamingDecoder::new(file)
+        .unwrap()
+        .read_to_end(&mut data)
+        .unwrap();
+    data
+}
+
+/// The NTFS volume of `tests/fixtures/generate-ntfs.sh`.
+fn ntfs_volume() -> Vec<u8> {
+    volume_fixture("ntfs.img")
+}
+
+/// A volume checked in as `tests/fixtures/<name>.zst`.
+fn volume_fixture(name: &str) -> Vec<u8> {
+    unzstd(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(format!("{name}.zst")),
+    )
+}
+
+/// A FAT volume with `/EFI/BOOT/hello.txt`.
+fn fat_volume() -> Vec<u8> {
+    let mut volume = Cursor::new(vec![0; 2 * MIB]);
+    fatfs::format_volume(&mut volume, fatfs::FormatVolumeOptions::new()).unwrap();
+    {
+        let fs = fatfs::FileSystem::new(&mut volume, fatfs::FsOptions::new()).unwrap();
+        let boot = fs
+            .root_dir()
+            .create_dir("EFI")
+            .unwrap()
+            .create_dir("BOOT")
+            .unwrap();
+        boot.create_file("hello.txt")
+            .unwrap()
+            .write_all(b"hello fat\n")
+            .unwrap();
+    }
+    volume.into_inner()
+}
+
+/// A GPT disk: 1 EFI (FAT), 2 NTFS, 3 a Linux partition without a filesystem.
+fn disk_image() -> Vec<u8> {
+    gpt_disk(&[
+        (fat_volume(), EFI_TYPE),
+        (ntfs_volume(), BASIC_DATA_TYPE),
+        (vec![0; MIB], LINUX_TYPE),
+    ])
+}
+
+/// A GPT disk with a partition per volume, in 512 byte sectors starting at 1 MiB.
+fn gpt_disk(partitions: &[(Vec<u8>, [u8; 16])]) -> Vec<u8> {
+    let size = 2 * MIB + partitions.iter().map(|p| p.0.len()).sum::<usize>();
+    let mut disk = Cursor::new(vec![0; size]);
+    let mut gpt = gptman::GPT::new_from(&mut disk, 512, [7; 16]).unwrap();
+    let mut lba = 2048;
+    for (number, (data, kind)) in (1..).zip(partitions) {
+        let sectors = data.len() as u64 / 512;
+        gpt[number] = gptman::GPTPartitionEntry {
+            partition_type_guid: *kind,
+            unique_partition_guid: [number as u8; 16],
+            starting_lba: lba,
+            ending_lba: lba + sectors - 1,
+            attribute_bits: 0,
+            partition_name: "".into(),
+        };
+        disk.get_mut()[lba as usize * 512..][..data.len()].copy_from_slice(data);
+        lba += sectors;
+    }
+    gpt.write_into(&mut disk).unwrap();
+    disk.into_inner()
+}
+
+fn image_fixture() -> Fixture {
+    let disk = disk_image();
+    Fixture::with_source(|source| fs::write(source.join("disk.img"), disk).unwrap())
+}
+
+fn names(entries: &[restic_gtk::backend::Entry]) -> Vec<&str> {
+    entries.iter().map(|e| e.name.as_str()).collect()
+}
+
+#[test]
+fn lists_the_partitions_of_a_disk_image() {
+    let fixture = image_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    let data = session.list_dir(&snapshot, Path::new("/data")).unwrap();
+    assert_eq!(data[0].kind, EntryKind::DiskImage);
+    assert!(!data[0].inside_image);
+
+    let partitions = session.list_dir(&snapshot, Path::new(IMAGE)).unwrap();
+    assert_eq!(
+        names(&partitions),
+        ["Partition 1 (EFI)", "Partition 2", "Partition 3"]
+    );
+    assert_eq!(partitions[0].kind, EntryKind::Partition);
+    assert_eq!(partitions[1].kind, EntryKind::Partition);
+    assert!(matches!(partitions[2].kind, EntryKind::Unavailable { .. }));
+    assert_eq!(partitions[1].size, 4 * MIB as u64);
+    assert!(partitions.iter().all(|p| p.inside_image));
+    assert_eq!(partitions[1].path, Path::new(IMAGE).join("Partition 2"));
+}
+
+#[test]
+fn browses_and_opens_files_on_ntfs() {
+    let fixture = image_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let volume = Path::new(IMAGE).join("Partition 2");
+
+    let root = session.list_dir(&snapshot, &volume).unwrap();
+    assert_eq!(names(&root), ["docs", "empty", "big.bin", "link"]);
+    assert!(root.iter().all(|e| e.inside_image && e.mtime.is_some()));
+    assert_eq!(root[2].size, 300_000);
+    assert_eq!(
+        root[3].kind,
+        EntryKind::Symlink {
+            target: "docs".into()
+        }
+    );
+
+    let docs = session.list_dir(&snapshot, &volume.join("docs")).unwrap();
+    assert_eq!(names(&docs), ["sub", "größe.txt", "readme.txt"]);
+    // Lookups ignore case, like Windows.
+    let sub = session
+        .list_dir(&snapshot, &volume.join("DOCS/Sub"))
+        .unwrap();
+    assert_eq!(names(&sub), ["deep.txt"]);
+
+    let dir = fixture.dir.path().join("runtime");
+    let extract = |path: &str| {
+        let file = session
+            .extract_file(&snapshot, &volume.join(path), &dir)
+            .unwrap();
+        assert_eq!(mode(&file), 0o400);
+        fs::read(file).unwrap()
+    };
+    assert_eq!(extract("docs/größe.txt"), b"unicode\n");
+    assert_eq!(extract("docs/sub/deep.txt"), b"deep\n");
+    let big = extract("big.bin");
+    assert!(
+        big.iter()
+            .enumerate()
+            .all(|(i, &b)| b == (i * 7 % 251) as u8)
+    );
+    assert_eq!(big.len(), 300_000);
+}
+
+#[test]
+fn browses_and_opens_files_on_fat() {
+    let fixture = image_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let boot = Path::new(IMAGE).join("Partition 1 (EFI)/EFI/BOOT");
+
+    let entries = session.list_dir(&snapshot, &boot).unwrap();
+    assert_eq!(names(&entries), ["hello.txt"]);
+    assert_eq!(entries[0].size, 10);
+
+    let file = session
+        .extract_file(&snapshot, &boot.join("hello.txt"), fixture.dir.path())
+        .unwrap();
+    assert_eq!(fs::read_to_string(file).unwrap(), "hello fat\n");
+}
+
+#[test]
+fn reports_what_a_disk_image_cannot_show() {
+    let fixture = image_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let image = Path::new(IMAGE);
+
+    let result = session.list_dir(&snapshot, &image.join("Partition 3"));
+    assert!(
+        matches!(result, Err(Error::UnsupportedFilesystem(_))),
+        "{result:?}"
+    );
+    let result = session.list_dir(&snapshot, &image.join("Partition 9"));
+    assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+    let result = session.list_dir(&snapshot, &image.join("Partition 2/missing"));
+    assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+    let result = session.list_dir(&snapshot, &image.join("Partition 2/big.bin"));
+    assert!(matches!(result, Err(Error::NotADirectory(_))), "{result:?}");
+    let result = session.extract_file(
+        &snapshot,
+        &image.join("Partition 2/docs"),
+        fixture.dir.path(),
+    );
+    assert!(matches!(result, Err(Error::NotAFile(_))), "{result:?}");
+    let result = session.extract_file(
+        &snapshot,
+        &image.join("Partition 2/link"),
+        fixture.dir.path(),
+    );
+    assert!(
+        matches!(result, Err(Error::UnsupportedFile { .. })),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn restores_a_disk_image_as_a_file() {
+    let fixture = image_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    let whole = RestoreRequest {
+        items: vec![IMAGE.into()],
+        target: fixture.folder("whole"),
+    };
+    session.restore(&snapshot, &whole, |_| {}).unwrap();
+    assert_eq!(
+        fs::read(whole.target.join("disk.img")).unwrap(),
+        fs::read(fixture.dir.path().join("source/disk.img")).unwrap()
+    );
+}
+
+#[test]
+fn restores_folders_from_a_disk_image() {
+    let fixture = image_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let volume = Path::new(IMAGE).join("Partition 2");
+    let target = fixture.folder("target");
+    let request = RestoreRequest {
+        items: vec![volume.join("docs")],
+        target: target.clone(),
+    };
+
+    let preview = session.preview_restore(&snapshot, &request).unwrap();
+    assert_eq!((preview.files, preview.conflicts), (3, 0));
+    assert_eq!(preview.bytes, 11 + 8 + 5);
+    assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+
+    let (updates, sink) = recorder();
+    let summary = session.restore(&snapshot, &request, sink).unwrap();
+    assert_eq!(summary.skipped, 0);
+    let last = updates.lock().unwrap().last().cloned().unwrap();
+    assert!(last.finished && last.position == preview.bytes);
+
+    let docs = target.join("docs");
+    assert_eq!(
+        fs::read_to_string(docs.join("readme.txt")).unwrap(),
+        "hello ntfs\n"
+    );
+    assert_eq!(
+        fs::read_to_string(docs.join("größe.txt")).unwrap(),
+        "unicode\n"
+    );
+    assert_eq!(
+        fs::read_to_string(docs.join("sub/deep.txt")).unwrap(),
+        "deep\n"
+    );
+    let listed = session.list_dir(&snapshot, &volume.join("docs")).unwrap();
+    let readme = listed.iter().find(|e| e.name == "readme.txt").unwrap();
+    assert_eq!(
+        fs::metadata(docs.join("readme.txt"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        std::time::SystemTime::from(readme.mtime.unwrap())
+    );
+    // Nothing half written left behind.
+    assert_eq!(fs::read_dir(&docs).unwrap().count(), 3);
+
+    // Unchanged files are kept, changed ones replaced after asking.
+    let preview = session.preview_restore(&snapshot, &request).unwrap();
+    assert_eq!((preview.files, preview.conflicts), (0, 0));
+    write(&docs.join("readme.txt"), "mine\n");
+    let preview = session.preview_restore(&snapshot, &request).unwrap();
+    assert_eq!((preview.files, preview.conflicts), (1, 1));
+    session.restore(&snapshot, &request, |_| {}).unwrap();
+    assert_eq!(
+        fs::read_to_string(docs.join("readme.txt")).unwrap(),
+        "hello ntfs\n"
+    );
+}
+
+#[test]
+fn restores_files_and_partitions_from_a_disk_image() {
+    let fixture = image_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let target = fixture.folder("target");
+    let request = RestoreRequest {
+        items: vec![
+            Path::new(IMAGE).join("Partition 2/big.bin"),
+            Path::new(IMAGE).join("Partition 1 (EFI)"),
+        ],
+        target: target.clone(),
+    };
+    let summary = session.restore(&snapshot, &request, |_| {}).unwrap();
+    assert_eq!(summary.skipped, 0);
+    let big = fs::read(target.join("big.bin")).unwrap();
+    assert!(
+        big.len() == 300_000
+            && big
+                .iter()
+                .enumerate()
+                .all(|(i, b)| *b == (i * 7 % 251) as u8)
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("Partition 1 (EFI)/EFI/BOOT/hello.txt")).unwrap(),
+        "hello fat\n"
+    );
+
+    // A whole NTFS volume: links are left out.
+    let request = RestoreRequest {
+        items: vec![Path::new(IMAGE).join("Partition 2")],
+        target: target.clone(),
+    };
+    assert_eq!(
+        session
+            .preview_restore(&snapshot, &request)
+            .unwrap()
+            .skipped,
+        1
+    );
+    let summary = session.restore(&snapshot, &request, |_| {}).unwrap();
+    assert_eq!(summary.skipped, 1);
+    let volume = target.join("Partition 2");
+    assert!(volume.join("empty").is_dir());
+    assert!(volume.join("docs/sub/deep.txt").is_file());
+    assert!(fs::symlink_metadata(volume.join("link")).is_err());
+}
+
+#[test]
+fn restore_from_a_disk_image_checks_the_target_first() {
+    let fixture = image_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    let target = fixture.folder("target");
+    write(&target.join("docs/sub"), "mine\n");
+    let request = RestoreRequest {
+        items: vec![Path::new(IMAGE).join("Partition 2/docs")],
+        target: target.clone(),
+    };
+    for result in [
+        session.preview_restore(&snapshot, &request).map(|_| ()),
+        session.restore(&snapshot, &request, |_| {}).map(|_| ()),
+    ] {
+        match result {
+            Err(Error::TargetExists { path, existing }) => {
+                assert_eq!((path, existing), (target.join("docs/sub"), "a file"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(!target.join("docs/readme.txt").exists());
+
+    let unavailable = RestoreRequest {
+        items: vec![Path::new(IMAGE).join("Partition 3")],
+        target: fixture.folder("other"),
+    };
+    let result = session.restore(&snapshot, &unavailable, |_| {});
+    assert!(
+        matches!(result, Err(Error::UnsupportedFilesystem(_))),
+        "{result:?}"
+    );
+}
+
+// VM disk formats: the NTFS volume in qcow2, VHD, VHDX and VMDK containers.
+
+/// A VM disk of `tests/fixtures/generate-containers.sh`.
+fn container(name: &str) -> Vec<u8> {
+    unzstd(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/containers")
+            .join(format!("{name}.zst")),
+    )
+}
+
+/// A snapshot whose `/data` holds `files`.
+fn with_files(files: &[(&str, Vec<u8>)]) -> Fixture {
+    Fixture::with_source(|source| {
+        for (name, data) in files {
+            fs::write(source.join(name), data).unwrap();
+        }
+    })
+}
+
+fn vmdk_descriptor(create_type: &str, parent_cid: &str, extents: &[&str]) -> Vec<u8> {
+    format!(
+        "# Disk DescriptorFile\nversion=1\nCID=12345678\nparentCID={parent_cid}\n\
+         createType=\"{create_type}\"\n\n# Extent description\n{}\n\n# The Disk Data Base\n#DDB\n",
+        extents.join("\n")
+    )
+    .into_bytes()
+}
+
+/// Browses `/data/<image>` down to its files and reads them whole.
+fn check_ntfs_image(fixture: &Fixture, session: &Session, image: &str) {
+    let snapshot = fixture.snapshot(session);
+    let image = Path::new("/data").join(image);
+    let partitions = session.list_dir(&snapshot, &image).unwrap();
+    assert_eq!(names(&partitions), ["Partition 1"], "{image:?}");
+    let volume = image.join("Partition 1");
+    let root = session.list_dir(&snapshot, &volume).unwrap();
+    assert_eq!(
+        names(&root),
+        ["docs", "empty", "big.bin", "link"],
+        "{image:?}"
+    );
+    assert_eq!(root[2].size, 300_000);
+
+    let dir = fixture.dir.path().join("runtime");
+    let readme = session
+        .extract_file(&snapshot, &volume.join("docs/readme.txt"), &dir)
+        .unwrap();
+    assert_eq!(fs::read(readme).unwrap(), b"hello ntfs\n");
+    let big = session
+        .extract_file(&snapshot, &volume.join("big.bin"), &dir)
+        .unwrap();
+    let big = fs::read(big).unwrap();
+    assert!(
+        big.len() == 300_000
+            && big
+                .iter()
+                .enumerate()
+                .all(|(i, b)| *b == (i * 7 % 251) as u8),
+        "{image:?}"
+    );
+}
+
+#[test]
+fn browses_every_container_format() {
+    let images = [
+        "plain.qcow2",
+        "zlib.qcow2",
+        "zstd.qcow2",
+        "fixed.vhd",
+        "dynamic.vhd",
+        "fixed.vhdx",
+        "dynamic.vhdx",
+        "sparse.vmdk",
+        "stream.vmdk",
+    ];
+    let files: Vec<(&str, Vec<u8>)> = images.iter().map(|name| (*name, container(name))).collect();
+    let fixture = with_files(&files);
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let data = session.list_dir(&snapshot, Path::new("/data")).unwrap();
+    assert!(
+        data.iter().all(|e| e.kind == EntryKind::DiskImage),
+        "{data:?}"
+    );
+    for image in images {
+        check_ntfs_image(&fixture, &session, image);
+    }
+}
+
+#[test]
+fn browses_vmdk_descriptors() {
+    let ntfs = ntfs_volume();
+    let (first, second) = ntfs.split_at(ntfs.len() / 2);
+    let fixture = with_files(&[
+        (
+            "flat.vmdk",
+            vmdk_descriptor(
+                "monolithicFlat",
+                "ffffffff",
+                &["RW 8192 FLAT \"flat-flat.vmdk\" 0"],
+            ),
+        ),
+        ("flat-flat.vmdk", ntfs.clone()),
+        (
+            "split.vmdk",
+            vmdk_descriptor(
+                "twoGbMaxExtentFlat",
+                "ffffffff",
+                &[
+                    "RW 4096 FLAT \"split-f001.vmdk\" 0",
+                    "RW 4096 FLAT \"split-f002.vmdk\" 0",
+                ],
+            ),
+        ),
+        ("split-f001.vmdk", first.to_vec()),
+        ("split-f002.vmdk", second.to_vec()),
+        (
+            "sparse.vmdk",
+            vmdk_descriptor(
+                "twoGbMaxExtentSparse",
+                "ffffffff",
+                &["RW 8192 SPARSE \"sparse-s001.vmdk\""],
+            ),
+        ),
+        ("sparse-s001.vmdk", container("sparse.vmdk")),
+    ]);
+    let session = fixture.open();
+    for image in ["flat.vmdk", "split.vmdk", "sparse.vmdk"] {
+        check_ntfs_image(&fixture, &session, image);
+    }
+}
+
+#[test]
+fn refuses_images_that_need_a_parent() {
+    let mut vhd = container("dynamic.vhd");
+    let len = vhd.len();
+    for footer in [0, len - 512] {
+        vhd[footer + 60..footer + 64].copy_from_slice(&4u32.to_be_bytes());
+    }
+    let mut vhdx = container("dynamic.vhdx");
+    vhdx[0x31_0004] |= 2;
+    let descriptor =
+        |create_type, parent_cid, extent| vmdk_descriptor(create_type, parent_cid, &[extent]);
+    let cases = [
+        ("backing.qcow2", container("backing.qcow2"), "backing file"),
+        ("child.vmdk", container("child.vmdk"), "parent"),
+        ("diff.vhd", vhd, "parent"),
+        ("diff.vhdx", vhdx, "parent"),
+        (
+            "missing.vmdk",
+            descriptor(
+                "monolithicFlat",
+                "ffffffff",
+                "RW 8192 FLAT \"gone-flat.vmdk\" 0",
+            ),
+            "not in the snapshot",
+        ),
+        (
+            "path.vmdk",
+            descriptor(
+                "monolithicFlat",
+                "ffffffff",
+                "RW 8192 FLAT \"../x-flat.vmdk\" 0",
+            ),
+            "path",
+        ),
+        (
+            "type.vmdk",
+            descriptor("vmfsSparse", "ffffffff", "RW 8192 SPARSE \"x.vmdk\""),
+            "can't be browsed",
+        ),
+        (
+            "snap.vmdk",
+            descriptor(
+                "monolithicFlat",
+                "deadbeef",
+                "RW 8192 FLAT \"x-flat.vmdk\" 0",
+            ),
+            "parent",
+        ),
+    ];
+    let files: Vec<(&str, Vec<u8>)> = cases.iter().map(|c| (c.0, c.1.clone())).collect();
+    let fixture = with_files(&files);
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    let data = session.list_dir(&snapshot, Path::new("/data")).unwrap();
+    assert!(
+        data.iter().all(|e| e.kind == EntryKind::DiskImage),
+        "{data:?}"
+    );
+    for (name, _, word) in &cases {
+        let result = session.list_dir(&snapshot, &Path::new("/data").join(name));
+        assert!(
+            matches!(&result, Err(Error::Image(reason)) if reason.contains(word)),
+            "{name}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn restores_from_a_compressed_container() {
+    let fixture = with_files(&[("disk.qcow2", container("zlib.qcow2"))]);
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let target = fixture.folder("target");
+    let request = RestoreRequest {
+        items: vec![PathBuf::from("/data/disk.qcow2/Partition 1/docs")],
+        target: target.clone(),
+    };
+    let summary = session.restore(&snapshot, &request, |_| {}).unwrap();
+    assert_eq!(summary.skipped, 0);
+    assert_eq!(
+        fs::read_to_string(target.join("docs/readme.txt")).unwrap(),
+        "hello ntfs\n"
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("docs/sub/deep.txt")).unwrap(),
+        "deep\n"
+    );
+}
+
+#[test]
+fn recognizes_vm_disk_names() {
+    use restic_gtk::backend::is_disk_image;
+    for name in [
+        "a.qcow2", "a.QCOW2", "a.qcow", "a.vhd", "a.vhdx", "a.vmdk", "/x/y.img",
+    ] {
+        assert!(is_disk_image(Path::new(name)), "{name}");
+    }
+    for name in ["a.avhdx", "a.txt", "a.vmdk.txt", "a"] {
+        assert!(!is_disk_image(Path::new(name)), "{name}");
+    }
+}
+
+// --- ext and LVM ------------------------------------------------------------
+
+const LINUX_IMAGE: &str = "/data/linux.img";
+const EXT2_IMAGE: &str = "/data/ext2.img";
+
+/// A GPT disk with 1 the ext4 volume of `tests/fixtures/generate-ext.sh` and 2 the LVM physical
+/// volume of `generate-lvm.sh`, plus the ext2 volume as an image without partition table.
+fn linux_fixture() -> Fixture {
+    let disk = gpt_disk(&[
+        (volume_fixture("ext4.img"), LINUX_TYPE),
+        (volume_fixture("lvm.img"), LINUX_TYPE),
+    ]);
+    Fixture::with_source(|source| {
+        fs::write(source.join("linux.img"), disk).unwrap();
+        fs::write(source.join("ext2.img"), volume_fixture("ext2.img")).unwrap();
+    })
+}
+
+fn is_pattern(data: &[u8]) -> bool {
+    data.len() == 300_000
+        && data
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| b == (i * 7 % 251) as u8)
+}
+
+/// Checks the files of `generate-ext.sh` in the volume at `volume`, which is the same for
+/// ext2, ext4 and the ext4 volume in LVM.
+fn check_ext_files(fixture: &Fixture, session: &Session, volume: &Path) {
+    let snapshot = fixture.snapshot(session);
+
+    let root = session.list_dir(&snapshot, volume).unwrap();
+    assert_eq!(
+        names(&root),
+        [
+            "docs",
+            "empty",
+            "lost+found",
+            "big.bin",
+            "hard.txt",
+            "link",
+            "sparse.bin"
+        ]
+    );
+    let time = restic_gtk::backend::jiff::Timestamp::from_second(1_700_000_000).unwrap();
+    assert!(
+        root.iter()
+            .all(|e| e.inside_image && e.mtime == Some(time) && e.path.starts_with(volume))
+    );
+    assert_eq!(root[0].kind, EntryKind::Dir);
+    assert_eq!(root[3].size, 300_000);
+    assert_eq!(root[4].size, 10);
+    assert_eq!(
+        root[5].kind,
+        EntryKind::Symlink {
+            target: "docs/readme.txt".into()
+        }
+    );
+    assert_eq!(root[6].size, 200_000);
+
+    let docs = session.list_dir(&snapshot, &volume.join("docs")).unwrap();
+    assert_eq!(names(&docs), ["sub", "größe.txt", "readme.txt"]);
+    let sub = session
+        .list_dir(&snapshot, &volume.join("docs/sub"))
+        .unwrap();
+    assert_eq!(names(&sub), ["deep.txt"]);
+    assert!(
+        session
+            .list_dir(&snapshot, &volume.join("empty"))
+            .unwrap()
+            .is_empty()
+    );
+    // Names are case-sensitive.
+    let result = session.list_dir(&snapshot, &volume.join("DOCS"));
+    assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+
+    let dir = fixture.dir.path().join("runtime");
+    let extract = |path: &str| {
+        let file = session
+            .extract_file(&snapshot, &volume.join(path), &dir)
+            .unwrap();
+        assert_eq!(mode(&file), 0o400);
+        fs::read(file).unwrap()
+    };
+    assert_eq!(extract("docs/readme.txt"), b"hello ext\n");
+    assert_eq!(extract("hard.txt"), b"hello ext\n");
+    assert_eq!(extract("docs/größe.txt"), b"unicode\n");
+    assert_eq!(extract("docs/sub/deep.txt"), b"deep\n");
+    assert!(is_pattern(&extract("big.bin")));
+    let sparse = extract("sparse.bin");
+    assert_eq!(sparse.len(), 200_000);
+    assert!(sparse[..199_996].iter().all(|&b| b == 0));
+    assert_eq!(&sparse[199_996..], b"tail");
+
+    let result = session.list_dir(&snapshot, &volume.join("big.bin"));
+    assert!(matches!(result, Err(Error::NotADirectory(_))), "{result:?}");
+    let result = session.list_dir(&snapshot, &volume.join("docs/missing"));
+    assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+    let result = session.extract_file(&snapshot, &volume.join("docs"), &dir);
+    assert!(matches!(result, Err(Error::NotAFile(_))), "{result:?}");
+    let result = session.extract_file(&snapshot, &volume.join("link"), &dir);
+    assert!(
+        matches!(&result, Err(Error::UnsupportedFile { reason, .. }) if reason.contains("docs/readme.txt")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn browses_and_opens_files_on_ext4() {
+    let fixture = linux_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    let partitions = session.list_dir(&snapshot, Path::new(LINUX_IMAGE)).unwrap();
+    assert_eq!(names(&partitions), ["Partition 1", "Partition 2 (LVM)"]);
+    assert!(partitions.iter().all(|p| p.kind == EntryKind::Partition));
+    check_ext_files(
+        &fixture,
+        &session,
+        &Path::new(LINUX_IMAGE).join("Partition 1"),
+    );
+}
+
+#[test]
+fn browses_and_opens_files_on_ext2_without_partition_table() {
+    let fixture = linux_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    let partitions = session.list_dir(&snapshot, Path::new(EXT2_IMAGE)).unwrap();
+    assert_eq!(names(&partitions), ["Partition 1"]);
+    assert_eq!(partitions[0].size, 4 * MIB as u64);
+    check_ext_files(
+        &fixture,
+        &session,
+        &Path::new(EXT2_IMAGE).join("Partition 1"),
+    );
+}
+
+#[test]
+fn browses_logical_volumes() {
+    let fixture = linux_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let pv = Path::new(LINUX_IMAGE).join("Partition 2 (LVM)");
+
+    // Hidden volumes (the parts of the thin pool) are left out.
+    let volumes = session.list_dir(&snapshot, &pv).unwrap();
+    assert_eq!(
+        names(&volumes),
+        ["vg0-pool0", "vg0-root", "vg0-swap", "vg0-thin1", "vg0-wide"]
+    );
+    assert!(volumes.iter().all(|v| v.inside_image));
+    assert_eq!(volumes[1].kind, EntryKind::Partition);
+    assert_eq!(volumes[1].path, pv.join("vg0-root"));
+    assert_eq!(volumes[1].size, 4 * MIB as u64);
+    assert_eq!(
+        volumes[1].mtime,
+        Some(restic_gtk::backend::jiff::Timestamp::from_second(1_700_000_000).unwrap())
+    );
+    let reason = |entry: &restic_gtk::backend::Entry| match &entry.kind {
+        EntryKind::Unavailable { reason } => reason.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(reason(&volumes[0]), "LVM thin pools can't be browsed");
+    assert_eq!(reason(&volumes[2]), "No supported filesystem");
+    assert_eq!(reason(&volumes[3]), "Thin LVM volumes can't be browsed yet");
+    assert!(reason(&volumes[4]).starts_with("This kind of LVM volume can't be browsed yet"));
+    assert_eq!(volumes[3].size, 8 * MIB as u64);
+
+    check_ext_files(&fixture, &session, &pv.join("vg0-root"));
+
+    for name in ["vg0-pool0", "vg0-thin1", "vg0-wide", "vg0-swap"] {
+        let result = session.list_dir(&snapshot, &pv.join(name));
+        assert!(
+            matches!(result, Err(Error::UnsupportedFilesystem(_))),
+            "{name}: {result:?}"
+        );
+    }
+    for name in ["vg0-missing", "vg0-pool0_tdata", "root"] {
+        let result = session.list_dir(&snapshot, &pv.join(name));
+        assert!(
+            matches!(result, Err(Error::NotFound(_))),
+            "{name}: {result:?}"
+        );
+    }
+    let result = session.extract_file(&snapshot, &pv.join("vg0-root"), fixture.dir.path());
+    assert!(matches!(result, Err(Error::NotAFile(_))), "{result:?}");
+    // Nothing on the way is encrypted.
+    let result = session.unlock_volume(&snapshot, &pv.join("vg0-root/docs"), "key");
+    assert!(matches!(result, Err(Error::Image(_))), "{result:?}");
+}
+
+#[test]
+fn restores_folders_and_volumes_from_a_logical_volume() {
+    let fixture = linux_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let pv = Path::new(LINUX_IMAGE).join("Partition 2 (LVM)");
+
+    let target = fixture.folder("docs");
+    let request = RestoreRequest {
+        items: vec![pv.join("vg0-root/docs")],
+        target: target.clone(),
+    };
+    let preview = session.preview_restore(&snapshot, &request).unwrap();
+    assert_eq!(
+        (preview.files, preview.conflicts, preview.bytes),
+        (3, 0, 23)
+    );
+    let summary = session.restore(&snapshot, &request, |_| {}).unwrap();
+    assert_eq!(summary.skipped, 0);
+    assert_eq!(
+        fs::read_to_string(target.join("docs/sub/deep.txt")).unwrap(),
+        "deep\n"
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("docs/größe.txt")).unwrap(),
+        "unicode\n"
+    );
+
+    // A whole volume: the link is left out.
+    let target = fixture.folder("volume");
+    let request = RestoreRequest {
+        items: vec![pv.join("vg0-root")],
+        target: target.clone(),
+    };
+    let summary = session.restore(&snapshot, &request, |_| {}).unwrap();
+    assert_eq!(summary.skipped, 1);
+    let volume = target.join("vg0-root");
+    assert!(is_pattern(&fs::read(volume.join("big.bin")).unwrap()));
+    assert_eq!(
+        fs::metadata(volume.join("sparse.bin")).unwrap().len(),
+        200_000
+    );
+    assert!(volume.join("empty").is_dir());
+    assert!(fs::symlink_metadata(volume.join("link")).is_err());
+
+    // The whole physical volume: the volumes that can't be read are left out too.
+    let target = fixture.folder("pv");
+    let request = RestoreRequest {
+        items: vec![pv.clone()],
+        target: target.clone(),
+    };
+    let summary = session.restore(&snapshot, &request, |_| {}).unwrap();
+    assert_eq!(summary.skipped, 4 + 1);
+    assert!(
+        target
+            .join("Partition 2 (LVM)/vg0-root/docs/readme.txt")
+            .is_file()
+    );
+
+    let request = RestoreRequest {
+        items: vec![pv.join("vg0-thin1")],
+        target: fixture.folder("thin"),
+    };
+    let result = session.restore(&snapshot, &request, |_| {});
+    assert!(
+        matches!(result, Err(Error::UnsupportedFilesystem(_))),
+        "{result:?}"
+    );
+}
+
+// --- encrypted volumes ---------------------------------------------------
+
+/// The encrypted volumes of `tests/fixtures/generate-encrypted.sh`, which says what they hold
+/// and what their keys are. Each volume is one partition: 1 BitLocker, 2 LUKS2, 3 LUKS1.
+const BITLOCKER: &str = "/data/disk.img/Partition 1";
+const LUKS2: &str = "/data/disk.img/Partition 2";
+const LUKS1: &str = "/data/disk.img/Partition 3";
+const BITLOCKER_PASSWORD: &str = "bitlocker fixture";
+const BITLOCKER_RECOVERY: &str = "013574-624679-047531-660000-008547-345565-299002-046662";
+const LUKS_PASSPHRASE: &str = "luks fixture";
+
+/// Images of the encrypted volumes, one for each of `images` (all the same).
+fn encrypted_fixture(images: &[&str]) -> Fixture {
+    let disk = gpt_disk(&[
+        (volume_fixture("bitlocker.img"), BASIC_DATA_TYPE),
+        (volume_fixture("luks2.img"), LINUX_TYPE),
+        (volume_fixture("luks1.img"), LINUX_TYPE),
+    ]);
+    Fixture::with_source(|source| {
+        for image in images {
+            fs::write(source.join(image), &disk).unwrap();
+        }
+    })
+}
+
+fn is_locked(result: &Result<Vec<restic_gtk::backend::Entry>, Error>, partition: &str) -> bool {
+    matches!(result, Err(Error::VolumeLocked(path)) if path == Path::new(partition))
+}
+
+#[test]
+fn lists_encrypted_partitions_as_such() {
+    let fixture = encrypted_fixture(&["disk.img"]);
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    let partitions = session.list_dir(&snapshot, Path::new(IMAGE)).unwrap();
+    assert_eq!(
+        names(&partitions),
+        ["Partition 1", "Partition 2", "Partition 3"]
+    );
+    assert!(
+        partitions
+            .iter()
+            .all(|p| p.kind == EntryKind::Encrypted && p.inside_image)
+    );
+    assert_eq!(partitions[0].size, MIB as u64);
+}
+
+#[test]
+fn entering_an_encrypted_partition_needs_its_key() {
+    let fixture = encrypted_fixture(&["disk.img"]);
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    for partition in [BITLOCKER, LUKS2, LUKS1] {
+        let partition = Path::new(partition);
+        let result = session.list_dir(&snapshot, partition);
+        assert!(
+            is_locked(&result, partition.to_str().unwrap()),
+            "{result:?}"
+        );
+        // Anything below it too, and the error names the partition.
+        let result = session.list_dir(&snapshot, &partition.join("docs"));
+        assert!(
+            is_locked(&result, partition.to_str().unwrap()),
+            "{result:?}"
+        );
+        let result =
+            session.extract_file(&snapshot, &partition.join("hello.txt"), fixture.dir.path());
+        assert!(matches!(result, Err(Error::VolumeLocked(_))), "{result:?}");
+    }
+}
+
+#[test]
+fn wrong_keys_leave_the_volume_locked() {
+    let fixture = encrypted_fixture(&["disk.img"]);
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    let wrong_recovery = "013574-624679-047531-660000-008547-345565-299002-046673";
+    for (partition, secret) in [
+        (BITLOCKER, "nope"),
+        (BITLOCKER, wrong_recovery),
+        (BITLOCKER, LUKS_PASSPHRASE),
+        (LUKS2, "nope"),
+        (LUKS2, BITLOCKER_PASSWORD),
+        (LUKS1, ""),
+    ] {
+        let result = session.unlock_volume(&snapshot, Path::new(partition), secret);
+        assert!(
+            matches!(result, Err(Error::WrongPassword)),
+            "{partition} {secret}: {result:?}"
+        );
+        let result = session.list_dir(&snapshot, Path::new(partition));
+        assert!(is_locked(&result, partition), "{result:?}");
+    }
+
+    // Not an encrypted partition, or not in an image at all.
+    let result = session.unlock_volume(&snapshot, Path::new(IMAGE), "pw");
+    assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+    let result = session.unlock_volume(&snapshot, Path::new("/data"), "pw");
+    assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+}
+
+#[test]
+fn browses_and_opens_files_in_unlocked_volumes() {
+    let fixture = encrypted_fixture(&["disk.img"]);
+    for (partition, secret) in [
+        (BITLOCKER, BITLOCKER_PASSWORD),
+        (BITLOCKER, BITLOCKER_RECOVERY),
+        // The digits of a recovery password may be grouped otherwise.
+        (
+            BITLOCKER,
+            "013574 624679 047531 660000 008547 345565 299002 046662",
+        ),
+        (LUKS2, LUKS_PASSPHRASE),
+        (LUKS1, LUKS_PASSPHRASE),
+    ] {
+        // A new session each time, nothing is unlocked yet.
+        let session = fixture.open();
+        let snapshot = fixture.snapshot(&session);
+        let volume = Path::new(partition);
+
+        session.unlock_volume(&snapshot, volume, secret).unwrap();
+        let root = session.list_dir(&snapshot, volume).unwrap();
+        assert_eq!(
+            names(&root),
+            ["docs", "hello.txt", "pattern.bin"],
+            "{partition}"
+        );
+        assert!(root.iter().all(|e| e.inside_image));
+        let docs = session.list_dir(&snapshot, &volume.join("docs")).unwrap();
+        assert_eq!(names(&docs), ["sub", "readme.txt"]);
+
+        let extract = |path: &str| {
+            let file = session
+                .extract_file(&snapshot, &volume.join(path), fixture.dir.path())
+                .unwrap();
+            fs::read(file).unwrap()
+        };
+        assert_eq!(extract("hello.txt"), b"hello encrypted\n");
+        assert_eq!(extract("docs/sub/deep.txt"), b"deep\n");
+        let pattern = extract("pattern.bin");
+        assert_eq!(pattern.len(), 20_000);
+        assert!(
+            pattern
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == (i * 7 % 251) as u8)
+        );
+
+        // Unlocking an open volume again keeps it open, also from a path inside it.
+        session
+            .unlock_volume(&snapshot, &volume.join("docs"), secret)
+            .unwrap();
+        assert_eq!(
+            names(&session.list_dir(&snapshot, volume).unwrap()).len(),
+            3
+        );
+
+        // The partition listing is the same before and after.
+        let partitions = session.list_dir(&snapshot, Path::new(IMAGE)).unwrap();
+        assert!(partitions.iter().all(|p| p.kind == EntryKind::Encrypted));
+    }
+}
+
+#[test]
+fn keys_are_kept_for_the_session_and_fit_the_same_volume_only() {
+    let fixture = encrypted_fixture(&["disk.img", "other.img"]);
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+
+    session
+        .unlock_volume(&snapshot, Path::new(BITLOCKER), BITLOCKER_RECOVERY)
+        .unwrap();
+    // The same volume in another image opens without asking, the other volumes don't.
+    let other =
+        |partition: u32| Path::new("/data/other.img").join(format!("Partition {partition}"));
+    let entries = session.list_dir(&snapshot, &other(1)).unwrap();
+    assert_eq!(names(&entries), ["docs", "hello.txt", "pattern.bin"]);
+    let result = session.list_dir(&snapshot, &other(2));
+    assert!(is_locked(&result, other(2).to_str().unwrap()), "{result:?}");
+
+    // Unlocking works the other way round as well, and again for a volume that is open already.
+    session
+        .unlock_volume(&snapshot, &other(2), LUKS_PASSPHRASE)
+        .unwrap();
+    assert!(session.list_dir(&snapshot, Path::new(LUKS2)).is_ok());
+    session
+        .unlock_volume(&snapshot, Path::new(BITLOCKER), BITLOCKER_PASSWORD)
+        .unwrap();
+    assert!(session.list_dir(&snapshot, Path::new(BITLOCKER)).is_ok());
+
+    // Nothing is kept beyond the session.
+    let again = fixture.open();
+    let result = again.list_dir(&fixture.snapshot(&again), Path::new(BITLOCKER));
+    assert!(is_locked(&result, BITLOCKER), "{result:?}");
+}
+
+#[test]
+fn restores_from_unlocked_volumes_and_refuses_locked_ones() {
+    let fixture = encrypted_fixture(&["disk.img"]);
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let target = fixture.folder("target");
+    let request = |items: &[&str]| RestoreRequest {
+        items: items.iter().map(PathBuf::from).collect(),
+        target: target.clone(),
+    };
+
+    let locked = request(&[LUKS2]);
+    for result in [
+        session.preview_restore(&snapshot, &locked).map(|_| ()),
+        session.restore(&snapshot, &locked, |_| {}).map(|_| ()),
+    ] {
+        assert!(matches!(result, Err(Error::VolumeLocked(_))), "{result:?}");
+    }
+    assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+
+    session
+        .unlock_volume(&snapshot, Path::new(LUKS2), LUKS_PASSPHRASE)
+        .unwrap();
+    session
+        .unlock_volume(&snapshot, Path::new(BITLOCKER), BITLOCKER_RECOVERY)
+        .unwrap();
+    let both = request(&[LUKS2, "/data/disk.img/Partition 1/docs"]);
+    let preview = session.preview_restore(&snapshot, &both).unwrap();
+    assert_eq!((preview.files, preview.conflicts), (6, 0));
+    let summary = session.restore(&snapshot, &both, |_| {}).unwrap();
+    assert_eq!(summary.skipped, 0);
+    assert_eq!(
+        fs::read_to_string(target.join("Partition 2/docs/sub/deep.txt")).unwrap(),
+        "deep\n"
+    );
+    assert_eq!(
+        fs::read(target.join("Partition 2/pattern.bin"))
+            .unwrap()
+            .len(),
+        20_000
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("docs/readme.txt")).unwrap(),
+        "readme\n"
+    );
+
+    // The third volume is still locked, and nothing of it is written.
+    let result = session.restore(&snapshot, &request(&[LUKS1]), |_| {});
+    assert!(matches!(result, Err(Error::VolumeLocked(_))), "{result:?}");
+    assert!(!target.join("Partition 3").exists());
+}
+
+// --- nested layers -----------------------------------------------------------
+
+/// `tests/fixtures/luks-lvm.img.zst` of `generate-lvm.sh`: a LUKS1 volume (passphrase "luks
+/// fixture") holding the LVM volume group vg1 with `root` (the ext4 fixture), `crypt` (the
+/// LUKS2 fixture, same passphrase, a FAT volume inside), `fat` (a FAT volume with
+/// `hello.txt`) and `swap` (zeros). `nested.img` is a GPT disk with it as partition 1,
+/// `nested.qcow2` the bare volume in a qcow2 container.
+const NESTED_IMAGE: &str = "/data/nested.img";
+const NESTED_QCOW2: &str = "/data/nested.qcow2";
+
+fn nested_fixture() -> Fixture {
+    let disk = gpt_disk(&[(volume_fixture("luks-lvm.img"), LINUX_TYPE)]);
+    with_files(&[
+        ("nested.img", disk),
+        ("nested.qcow2", container("nested.qcow2")),
+    ])
+}
+
+#[test]
+fn browses_lvm_and_its_filesystems_under_luks() {
+    let fixture = nested_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let partition = Path::new(NESTED_IMAGE).join("Partition 1");
+
+    let partitions = session
+        .list_dir(&snapshot, Path::new(NESTED_IMAGE))
+        .unwrap();
+    assert_eq!(names(&partitions), ["Partition 1"]);
+    assert_eq!(partitions[0].kind, EntryKind::Encrypted);
+    let result = session.list_dir(&snapshot, &partition.join("vg1-root/docs"));
+    assert!(
+        is_locked(&result, partition.to_str().unwrap()),
+        "{result:?}"
+    );
+
+    // Partition -> LUKS -> LVM: the logical volumes, each with its own kind.
+    session
+        .unlock_volume(&snapshot, &partition, LUKS_PASSPHRASE)
+        .unwrap();
+    let volumes = session.list_dir(&snapshot, &partition).unwrap();
+    assert_eq!(
+        names(&volumes),
+        ["vg1-crypt", "vg1-fat", "vg1-root", "vg1-swap"]
+    );
+    assert_eq!(volumes[0].kind, EntryKind::Encrypted);
+    assert_eq!(volumes[1].kind, EntryKind::Partition);
+    assert_eq!(volumes[2].kind, EntryKind::Partition);
+    assert_eq!(
+        volumes[3].kind,
+        EntryKind::Unavailable {
+            reason: "No supported filesystem".to_owned()
+        }
+    );
+    assert_eq!(volumes[0].size, 2 * MIB as u64);
+    assert_eq!(volumes[2].size, 4 * MIB as u64);
+    assert!(volumes.iter().all(|v| v.inside_image));
+
+    // -> ext4, with everything the plain ext4 volume offers.
+    check_ext_files(&fixture, &session, &partition.join("vg1-root"));
+
+    // -> FAT inside a logical volume.
+    let fat = partition.join("vg1-fat");
+    assert_eq!(
+        names(&session.list_dir(&snapshot, &fat).unwrap()),
+        ["hello.txt"]
+    );
+    let hello = session
+        .extract_file(&snapshot, &fat.join("hello.txt"), fixture.dir.path())
+        .unwrap();
+    assert_eq!(fs::read(hello).unwrap(), b"hello lvm fat\n");
+
+    // -> LUKS inside a logical volume: locked on its own, named by its own path.
+    let crypt = partition.join("vg1-crypt");
+    let result = session.list_dir(&snapshot, &crypt.join("docs"));
+    assert!(is_locked(&result, crypt.to_str().unwrap()), "{result:?}");
+    let result = session.unlock_volume(&snapshot, &crypt, "nope");
+    assert!(matches!(result, Err(Error::WrongPassword)), "{result:?}");
+    assert!(is_locked(
+        &session.list_dir(&snapshot, &crypt),
+        crypt.to_str().unwrap()
+    ));
+    session
+        .unlock_volume(&snapshot, &crypt.join("docs"), LUKS_PASSPHRASE)
+        .unwrap();
+    assert_eq!(
+        names(&session.list_dir(&snapshot, &crypt).unwrap()),
+        ["docs", "hello.txt", "pattern.bin"]
+    );
+    let deep = session
+        .extract_file(
+            &snapshot,
+            &crypt.join("docs/sub/deep.txt"),
+            fixture.dir.path(),
+        )
+        .unwrap();
+    assert_eq!(fs::read(deep).unwrap(), b"deep\n");
+
+    // A path inside the partition means the partition: unlocked again, nothing is lost.
+    session
+        .unlock_volume(&snapshot, &fat, LUKS_PASSPHRASE)
+        .unwrap();
+    assert_eq!(
+        names(&session.list_dir(&snapshot, &crypt).unwrap()),
+        ["docs", "hello.txt", "pattern.bin"]
+    );
+
+    // Both keys are kept for the session: a new image with the same volumes opens at once.
+    let other = fixture.open();
+    let result = other.list_dir(&fixture.snapshot(&other), &crypt);
+    assert!(
+        is_locked(&result, partition.to_str().unwrap()),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn restores_through_nested_layers() {
+    let fixture = nested_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let partition = Path::new(NESTED_IMAGE).join("Partition 1");
+    let request = |item: PathBuf, target: PathBuf| RestoreRequest {
+        items: vec![item],
+        target,
+    };
+
+    // The whole partition while a volume inside is still locked: nothing is written.
+    session
+        .unlock_volume(&snapshot, &partition, LUKS_PASSPHRASE)
+        .unwrap();
+    let target = fixture.folder("locked");
+    let result = session.restore(
+        &snapshot,
+        &request(partition.clone(), target.clone()),
+        |_| {},
+    );
+    assert!(matches!(result, Err(Error::VolumeLocked(_))), "{result:?}");
+    assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+
+    let target = fixture.folder("docs");
+    let summary = session
+        .restore(
+            &snapshot,
+            &request(partition.join("vg1-root/docs"), target.clone()),
+            |_| {},
+        )
+        .unwrap();
+    assert_eq!(summary.skipped, 0);
+    assert_eq!(
+        fs::read_to_string(target.join("docs/sub/deep.txt")).unwrap(),
+        "deep\n"
+    );
+
+    // Everything unlocked: the whole partition, the ext link and the swap volume left out.
+    session
+        .unlock_volume(&snapshot, &partition.join("vg1-crypt"), LUKS_PASSPHRASE)
+        .unwrap();
+    let target = fixture.folder("all");
+    let preview = session
+        .preview_restore(&snapshot, &request(partition.clone(), target.clone()))
+        .unwrap();
+    assert_eq!(preview.conflicts, 0);
+    let summary = session
+        .restore(
+            &snapshot,
+            &request(partition.clone(), target.clone()),
+            |_| {},
+        )
+        .unwrap();
+    assert_eq!(summary.skipped, 2);
+    let root = target.join("Partition 1");
+    assert!(is_pattern(
+        &fs::read(root.join("vg1-root/big.bin")).unwrap()
+    ));
+    assert_eq!(
+        fs::read(root.join("vg1-crypt/pattern.bin")).unwrap().len(),
+        20_000
+    );
+    assert_eq!(
+        fs::read(root.join("vg1-fat/hello.txt")).unwrap(),
+        b"hello lvm fat\n"
+    );
+    assert!(!root.join("vg1-swap").exists());
+}
+
+#[test]
+fn browses_nested_layers_inside_a_qcow2_container() {
+    let fixture = nested_fixture();
+    let session = fixture.open();
+    let snapshot = fixture.snapshot(&session);
+    let partition = Path::new(NESTED_QCOW2).join("Partition 1");
+
+    let partitions = session
+        .list_dir(&snapshot, Path::new(NESTED_QCOW2))
+        .unwrap();
+    assert_eq!(names(&partitions), ["Partition 1"]);
+    assert_eq!(partitions[0].kind, EntryKind::Encrypted);
+    assert!(is_locked(
+        &session.list_dir(&snapshot, &partition),
+        partition.to_str().unwrap()
+    ));
+    session
+        .unlock_volume(&snapshot, &partition, LUKS_PASSPHRASE)
+        .unwrap();
+    assert_eq!(
+        names(&session.list_dir(&snapshot, &partition).unwrap()),
+        ["vg1-crypt", "vg1-fat", "vg1-root", "vg1-swap"]
+    );
+    check_ext_files(&fixture, &session, &partition.join("vg1-root"));
+
+    // The same volume as in the raw image, so its key is known already.
+    session
+        .unlock_volume(
+            &snapshot,
+            &Path::new(NESTED_IMAGE).join("Partition 1/vg1-crypt"),
+            LUKS_PASSPHRASE,
+        )
+        .unwrap();
+    let crypt = partition.join("vg1-crypt");
+    assert_eq!(
+        names(&session.list_dir(&snapshot, &crypt).unwrap()),
+        ["docs", "hello.txt", "pattern.bin"]
+    );
 }
