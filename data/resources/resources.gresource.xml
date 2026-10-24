@@ -3,6 +3,7 @@
   <gresource prefix="/de/gg_itsystemhaus/ResticGtk/">
     <file compressed="true" preprocess="xml-stripblanks">ui/browser-page.ui</file>
     <file compressed="true" preprocess="xml-stripblanks">ui/repo-dialog.ui</file>
+    <file compressed="true" preprocess="xml-stripblanks">ui/repo-sidebar.ui</file>
     <file compressed="true" preprocess="xml-stripblanks">ui/restore-dialog.ui</file>
     <file compressed="true" preprocess="xml-stripblanks">ui/snapshots-page.ui</file>
     <file compressed="true" preprocess="xml-stripblanks">ui/unlock-dialog.ui</file>

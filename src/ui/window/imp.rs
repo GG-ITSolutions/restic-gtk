@@ -11,6 +11,7 @@ use crate::ui::{
     details,
     objects::{RepoList, RepoObject},
     repo_dialog::RepoDialog,
+    repo_sidebar::RepoSidebar,
     restore_dialog::RestoreDialog,
     show_toast,
     snapshots_page::SnapshotsPage,
@@ -26,7 +27,7 @@ pub struct ResticGtkWindow {
     #[template_child]
     repo_banner: TemplateChild<adw::Banner>,
     #[template_child]
-    sidebar: TemplateChild<adw::Sidebar>,
+    sidebar: TemplateChild<RepoSidebar>,
     #[template_child]
     content_view: TemplateChild<adw::NavigationView>,
     #[template_child]
@@ -50,6 +51,7 @@ impl ObjectSubclass for ResticGtkWindow {
     type ParentType = adw::ApplicationWindow;
 
     fn class_init(klass: &mut Self::Class) {
+        RepoSidebar::ensure_type();
         klass.bind_template();
 
         klass.install_action("win.add-repository", None, |win, _, _| {
@@ -67,6 +69,12 @@ impl ObjectSubclass for ResticGtkWindow {
             if let Some(repo) = win.imp().action_target() {
                 repo.lock();
             }
+        });
+        klass.install_action("win.move-repository-up", None, |win, _, _| {
+            win.imp().move_repository_by(-1)
+        });
+        klass.install_action("win.move-repository-down", None, |win, _, _| {
+            win.imp().move_repository_by(1)
         });
         klass.install_action("win.remove-repository", None, |win, _, _| {
             win.imp().remove_repository()
@@ -101,54 +109,34 @@ impl ObjectImpl for ResticGtkWindow {
             }
         }
 
-        let section = adw::SidebarSection::new();
-        section.bind_model(Some(repos.model()), |item| {
-            let repo = item
-                .downcast_ref::<RepoObject>()
-                .expect("RepoList holds RepoObjects");
-            let sidebar_item = adw::SidebarItem::new("");
-            repo.bind_property("name", &sidebar_item, "title")
-                .sync_create()
-                .build();
-            repo.bind_property("display-location", &sidebar_item, "subtitle")
-                .sync_create()
-                .build();
-            repo.bind_property("unlocked", &sidebar_item, "icon-name")
-                .transform_to(|_, unlocked: bool| {
-                    Some(if unlocked {
-                        "changes-allow-symbolic"
-                    } else {
-                        "changes-prevent-symbolic"
-                    })
-                })
-                .sync_create()
-                .build();
-            sidebar_item
-        });
-        self.sidebar.append(section);
-        // Nothing is shown yet, so nothing is selected.
-        self.sidebar.set_selected(gtk::INVALID_LIST_POSITION);
-
+        self.sidebar.set_model(repos.model());
         self.sidebar.connect_activated(clone!(
             #[weak]
             obj,
-            move |_, index| {
-                if let Some(repo) = obj.imp().repos().get(index) {
-                    obj.imp().show_repository(&repo);
-                }
-            }
+            move |_, repo| obj.imp().show_repository(repo)
         ));
         self.sidebar.connect_setup_menu(clone!(
             #[weak]
             obj,
-            move |_, item| {
+            move |_, repo| {
                 let imp = obj.imp();
-                let repo = item.and_then(|item| imp.repos().get(item.section_index()));
-                let unlocked = repo.as_ref().is_some_and(RepoObject::unlocked);
+                let unlocked = repo.unlocked();
                 obj.action_set_enabled("win.repository-details", unlocked);
                 obj.action_set_enabled("win.lock-repository", unlocked);
-                imp.menu_target.replace(repo);
+                let model = imp.repos().model();
+                let position = model.find(repo);
+                obj.action_set_enabled("win.move-repository-up", position.is_some_and(|p| p > 0));
+                obj.action_set_enabled(
+                    "win.move-repository-down",
+                    position.is_some_and(|p| p + 1 < model.n_items()),
+                );
+                imp.menu_target.replace(Some(repo.clone()));
             }
+        ));
+        self.sidebar.connect_reorder(clone!(
+            #[weak]
+            obj,
+            move |_, repo, index| obj.imp().move_repository(repo, index)
         ));
         repos.model().connect_items_changed(clone!(
             #[weak]
@@ -237,7 +225,7 @@ impl ResticGtkWindow {
 
     fn show_welcome(&self) {
         self.shown.replace(None);
-        self.sidebar.set_selected(gtk::INVALID_LIST_POSITION);
+        self.sidebar.unselect();
         self.content_view.replace(&[self.welcome_page.get()]);
         self.split_view.set_show_content(false);
     }
@@ -254,9 +242,7 @@ impl ResticGtkWindow {
                 let imp = obj.imp();
                 match imp.repos().add(config) {
                     Ok(repo) => {
-                        if let Some(position) = imp.repos().model().find(&repo) {
-                            imp.sidebar.set_selected(position);
-                        }
+                        imp.sidebar.select(&repo);
                         imp.show_repository(&repo);
                     }
                     Err(err) => show_toast(&obj, &format!("Could not save the repository: {err}")),
@@ -282,6 +268,29 @@ impl ResticGtkWindow {
                 }
             }
         ));
+    }
+
+    fn move_repository(&self, repo: &RepoObject, index: u32) {
+        if let Err(err) = self.repos().move_to(repo, index) {
+            show_toast(&*self.obj(), &format!("Could not save the order: {err}"));
+        }
+    }
+
+    /// Moves the repository of the menu up (`-1`) or down (`1`).
+    fn move_repository_by(&self, offset: i32) {
+        let Some(repo) = self.action_target() else {
+            return;
+        };
+        let model = self.repos().model();
+        let Some(index) = model
+            .find(&repo)
+            .and_then(|position| position.checked_add_signed(offset))
+            .filter(|&index| index < model.n_items())
+        else {
+            return;
+        };
+        self.move_repository(&repo, index);
+        self.sidebar.focus_repo(&repo);
     }
 
     fn remove_repository(&self) {

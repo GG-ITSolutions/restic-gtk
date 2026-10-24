@@ -39,17 +39,9 @@ template $ResticGtkWindow: Adw.ApplicationWindow {
             title: _("Changes to this list are not saved");
           }
 
-          content: Adw.Sidebar sidebar {
+          content: $ResticGtkRepoSidebar sidebar {
             menu-model: repo_menu;
-
-            placeholder: Adw.StatusPage {
-              icon-name: "drive-harddisk-symbolic";
-              title: _("No Repositories");
-
-              styles [
-                "compact",
-              ]
-            };
+            collapsed: bind split_view.collapsed;
           };
         };
       };
@@ -124,6 +116,18 @@ menu repo_menu {
     item {
       label: _("_Lock");
       action: "win.lock-repository";
+    }
+  }
+
+  section {
+    item {
+      label: _("Move _Up");
+      action: "win.move-repository-up";
+    }
+
+    item {
+      label: _("Move _Down");
+      action: "win.move-repository-down";
     }
   }
 

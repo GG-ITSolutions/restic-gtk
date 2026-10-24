@@ -8,7 +8,8 @@ no `restic` binary is needed.
 
 ## Features
 
-- **Repository list** in the sidebar: add, edit, remove. Local paths, rest-servers
+- **Repository list** in the sidebar: add, edit, remove, reorder by drag and drop or with
+  "Move Up" / "Move Down" in the context menu. Local paths, rest-servers
   (`rest:https://user:password@host/repository/`) and S3 or S3-compatible storage (AWS, Hetzner,
   Wasabi, MinIO, …) with endpoint, bucket, path, region and access key ID. Pasting a restic URL
   such as `s3:https://host/bucket/path` fills in the S3 fields.

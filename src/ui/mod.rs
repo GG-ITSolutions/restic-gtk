@@ -6,6 +6,7 @@ mod format;
 mod objects;
 mod path_bar;
 mod repo_dialog;
+mod repo_sidebar;
 mod restore_dialog;
 mod snapshots_page;
 mod unlock_dialog;

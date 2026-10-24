@@ -1,0 +1,37 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $ResticGtkRepoSidebar: Adw.Bin {
+  child: Gtk.Stack stack {
+    Gtk.StackPage {
+      name: "empty";
+
+      child: Adw.StatusPage {
+        icon-name: "drive-harddisk-symbolic";
+        title: _("No Repositories");
+
+        styles [
+          "compact",
+        ]
+      };
+    }
+
+    Gtk.StackPage {
+      name: "list";
+
+      child: Gtk.ScrolledWindow {
+        hscrollbar-policy: never;
+
+        child: Gtk.ListView list_view {
+          accessibility {
+            label: _("Repositories");
+          }
+
+          styles [
+            "navigation-sidebar",
+          ]
+        };
+      };
+    }
+  };
+}

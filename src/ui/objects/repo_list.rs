@@ -31,10 +31,6 @@ impl RepoList {
         &self.model
     }
 
-    pub fn get(&self, position: u32) -> Option<RepoObject> {
-        self.model.item(position).and_downcast()
-    }
-
     fn configs(&self) -> Vec<RepoConfig> {
         self.model
             .iter::<RepoObject>()
@@ -59,6 +55,23 @@ impl RepoList {
             .collect();
         self.store.save(&configs)?;
         repo.set_config(config);
+        Ok(())
+    }
+
+    /// Moves `repo` to `index`, its position afterwards.
+    pub fn move_to(&self, repo: &RepoObject, index: u32) -> Result<()> {
+        let Some(from) = self.model.find(repo) else {
+            return Ok(());
+        };
+        if from == index {
+            return Ok(());
+        }
+        let mut configs = self.configs();
+        let config = configs.remove(from as usize);
+        configs.insert(index as usize, config);
+        self.store.save(&configs)?;
+        self.model.remove(from);
+        self.model.insert(index, repo);
         Ok(())
     }
 
