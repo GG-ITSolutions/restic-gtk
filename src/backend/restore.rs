@@ -448,8 +448,12 @@ impl Session {
                 EntryKind::Dir | EntryKind::Partition | EntryKind::Encrypted => {
                     check_existing(&destination, |kind| Ok(kind.is_dir()))?;
                     let children = match source.list(self, repo, snapshot, &inner) {
-                        // An encrypted folder below the picked entry is left out like a link.
-                        Err(Error::UnsupportedFile { .. }) if entry.path != top => {
+                        // An encrypted folder, or a volume without a readable filesystem, below
+                        // the picked entry is left out like a link. A locked volume still fails:
+                        // unlocking it would restore it.
+                        Err(Error::UnsupportedFile { .. } | Error::UnsupportedFilesystem(_))
+                            if entry.path != top =>
+                        {
                             skipped += 1;
                             continue;
                         }

@@ -2,7 +2,7 @@
 
 use std::{
     io::{self, Read, Seek, SeekFrom, Write},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use rustic_core::{repofile::Node, vfs::OpenFile};
@@ -141,7 +141,7 @@ impl Read for Shared {
         if len == 0 {
             return Ok(0);
         }
-        let mut source = self.source.lock().unwrap();
+        let mut source = lock(&self.source);
         source.seek(SeekFrom::Start(self.pos))?;
         let n = source.read(&mut buf[..len])?;
         self.pos += n as u64;
@@ -182,6 +182,12 @@ impl<R> Write for ReadOnly<R> {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// Locks `mutex`, also after a panic in another reader: the guarded state stays usable, a
+/// half-done read only moved a position that every read sets anew.
+pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]

@@ -76,7 +76,14 @@ pub fn read_partitions<R: Read + Seek>(disk: &mut R, len: u64) -> io::Result<Vec
     }
 
     let mut found = Vec::new();
-    if let Ok(gpt) = gptman::GPT::find_from(disk) {
+    // A read error is network trouble, not a missing table: report it, reading again may work.
+    let gpt = match gptman::GPT::find_from(disk) {
+        Err(gptman::Error::Io(err)) if err.kind() != io::ErrorKind::UnexpectedEof => {
+            return Err(err);
+        }
+        gpt => gpt,
+    };
+    if let Ok(gpt) = gpt {
         for (number, entry) in gpt.iter().filter(|(_, e)| e.is_used()) {
             let Ok(sectors) = entry.size() else { continue };
             found.push(Partition {
@@ -87,7 +94,13 @@ pub fn read_partitions<R: Read + Seek>(disk: &mut R, len: u64) -> io::Result<Vec
                 role: gpt_role(&entry.partition_type_guid),
             });
         }
-    } else if let Ok(mbr) = mbrman::MBR::read_from(disk, 512) {
+    } else if let Some(mbr) = match mbrman::MBR::read_from(disk, 512) {
+        Ok(mbr) => Some(mbr),
+        Err(mbrman::Error::Io(err)) if err.kind() != io::ErrorKind::UnexpectedEof => {
+            return Err(err);
+        }
+        Err(_) => None,
+    } {
         for (number, entry) in mbr.iter() {
             if !entry.is_used() || entry.is_extended() {
                 continue;

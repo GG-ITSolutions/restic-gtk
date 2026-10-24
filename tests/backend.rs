@@ -1693,6 +1693,15 @@ fn browses_and_opens_files_in_unlocked_volumes() {
                 .all(|(i, &b)| b == (i * 7 % 251) as u8)
         );
 
+        // Unlocking an open volume again keeps it open, also from a path inside it.
+        session
+            .unlock_volume(&snapshot, &volume.join("docs"), secret)
+            .unwrap();
+        assert_eq!(
+            names(&session.list_dir(&snapshot, volume).unwrap()).len(),
+            3
+        );
+
         // The partition listing is the same before and after.
         let partitions = session.list_dir(&snapshot, Path::new(IMAGE)).unwrap();
         assert!(partitions.iter().all(|p| p.kind == EntryKind::Encrypted));

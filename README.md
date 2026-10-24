@@ -25,7 +25,7 @@ no `restic` binary is needed.
 - **File browser** per snapshot with path bar and keyboard navigation (Enter, Alt+↑, Backspace).
 - **Open** a file with its default app. It is extracted read-only to
   `$XDG_RUNTIME_DIR/restic-gtk/` and removed when the app quits.
-- **Disk images** (`.img`, `.raw`, `.dd`, and the VM disk formats `.qcow2`, `.vhd`, `.vhdx`,
+- **Disk images** (`.img`, `.raw`, `.dd`, and the VM disk formats `.qcow2`, `.qcow`, `.vhd`, `.vhdx`,
   `.vmdk`) open like folders, without downloading them: first the partitions (GPT or MBR), then
   the files of NTFS, FAT and ext2/3/4 volumes; Linux LVM2 volumes show their logical volumes
   (`vg0-root`) as folders. Opening a file reads only
@@ -123,7 +123,7 @@ New files must be known to git (`git add`), otherwise the flake doesn't see them
   archives (`.z01`) are not supported, and archives with more than 500,000 entries are
   opened as a plain file. Names in code pages other than UTF-8 and CP437 may look garbled,
   times (stored without a time zone) are taken as local time of this computer. A ZIP inside a
-  ZIP or disk image is extracted completely before it opens.
+  ZIP or disk image doesn't open as a folder; opening it extracts it and hands it to its app.
 - Fragmented files in disk images are slow to open: every scattered piece fetches a whole blob
   (about 1 MiB) from the repository. Logs with NTFS compression are typical, a 79 MB Windows
   CBS log took about 90 s from a rest-server over the internet.

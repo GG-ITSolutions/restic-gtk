@@ -43,7 +43,7 @@ use self::{
     fat::FatVolume,
     ntfs::NtfsVolume,
     partition::{FsKind, Partition},
-    reader::{Shared, Slice},
+    reader::{Shared, Slice, lock},
 };
 use super::{Entry, EntryKind, Error, Result, session::IndexedRepo};
 
@@ -262,7 +262,7 @@ impl Layer {
         if fs.is_encrypted() {
             return self.unlocked(keys, path)?.open(keys, path);
         }
-        let mut opened = self.opened.lock().unwrap();
+        let mut opened = lock(&self.opened);
         if let Some(opened) = opened.as_ref() {
             return Ok((opened.clone(), source.clone()));
         }
@@ -293,18 +293,18 @@ impl Layer {
 
     /// The plaintext of the encrypted layer, unlocking it first if the session knows its key.
     fn unlocked(&self, keys: &KeyCache, path: &Path) -> Result<Arc<Layer>> {
-        if let Some(plain) = self.plain.lock().unwrap().as_ref() {
+        if let Some(plain) = lock(&self.plain).as_ref() {
             return Ok(plain.clone());
         }
         let (source, fs) = self.encrypted().expect("checked by the caller");
         let id = crypt::volume_id(fs, &mut source.clone())?;
-        let Some(secret) = keys.lock().unwrap().get(&id).cloned() else {
+        let Some(secret) = lock(keys).get(&id).cloned() else {
             return Err(Error::VolumeLocked(path.to_path_buf()));
         };
         match self.decrypt(source, fs, &secret) {
             // Not the key of this volume any more, e.g. it was encrypted anew: ask again.
             Err(Error::WrongPassword) => {
-                keys.lock().unwrap().remove(&id);
+                lock(keys).remove(&id);
                 Err(Error::VolumeLocked(path.to_path_buf()))
             }
             plain => plain,
@@ -319,11 +319,13 @@ impl Layer {
                 path.display()
             )));
         };
+        // Already open: keep what is open below instead of reading it again.
+        if lock(&self.plain).is_some() {
+            return Ok(());
+        }
         self.decrypt(source, fs, secret)?;
         let id = crypt::volume_id(fs, &mut source.clone())?;
-        keys.lock()
-            .unwrap()
-            .insert(id, Secret::new(secret.to_owned()));
+        lock(keys).insert(id, Secret::new(secret.to_owned()));
         Ok(())
     }
 
@@ -343,7 +345,7 @@ impl Layer {
             Ok((plain, fs))
         };
         let layer = Arc::new(Layer::new(String::new(), None, size, None, block));
-        *self.plain.lock().unwrap() = Some(layer.clone());
+        *lock(&self.plain) = Some(layer.clone());
         Ok(layer)
     }
 }
@@ -411,7 +413,7 @@ impl ImageCache {
     fn open(&self, image: &ImageRef) -> Result<Arc<OpenImage>> {
         let key = (image.tree.clone(), image.path.to_path_buf());
         {
-            let mut images = self.images.lock().unwrap();
+            let mut images = lock(&self.images);
             if let Some(index) = images.iter().position(|i| i.key == key) {
                 let open = images.remove(index);
                 images.push(open.clone());
@@ -453,7 +455,7 @@ impl ImageCache {
             .collect();
         let open = Arc::new(OpenImage { key, partitions });
 
-        let mut images = self.images.lock().unwrap();
+        let mut images = lock(&self.images);
         images.retain(|i| i.key != open.key);
         images.push(open.clone());
         if images.len() > OPEN_IMAGES {
